@@ -87,12 +87,20 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def audio_duration(path: Path) -> float:
+def audio_properties(path: Path) -> dict:
     result = subprocess.run(
-        ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=nokey=1:noprint_wrappers=1", str(path)],
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-show_entries", "stream=sample_rate,channels,bits_per_raw_sample,bits_per_sample", "-of", "json", str(path)],
         check=True, capture_output=True, text=True,
     )
-    return float(result.stdout.strip())
+    value = json.loads(result.stdout)
+    stream = value["streams"][0]
+    return {
+        "codec": path.suffix.lower().lstrip("."),
+        "sample_rate": int(stream["sample_rate"]),
+        "channels": int(stream["channels"]),
+        "bits_per_sample": int(stream.get("bits_per_raw_sample") or stream.get("bits_per_sample") or 0),
+        "duration_seconds": float(value["format"]["duration"]),
+    }
 
 
 def extract_microphones(source: Path, directory: Path) -> list[Path]:
@@ -214,7 +222,8 @@ class EvidenceProcessor:
             texts = [text for _, text in sense_results]
             channel = choose_microphone(texts)
             primary = self.qwen_transcribe(microphones[channel])
-            duration = audio_duration(source)
+            audio = audio_properties(source)
+            duration = audio["duration_seconds"]
             started = parse_capture_time(source)
             ended = started + dt.timedelta(seconds=duration)
             digest = sha256_file(source)
@@ -253,7 +262,7 @@ class EvidenceProcessor:
                     "evidence_kind": "fallible_asr",
                     "primary_asr": {"model": "Qwen3-ASR-1.7B", "runtime": "qwen-asr", "device": "cpu", "selected_microphone": channel},
                     "cross_check": {"model": "SenseVoiceSmall-Q8", "vad": "FSMN-VAD", "all_microphone_transcripts": texts},
-                    "audio": {"codec": source.suffix.lower().lstrip("."), "sample_rate": 48000, "channels": 3, "bits_per_sample": 24, "duration_seconds": duration},
+                    "audio": audio,
                     "speaker_diarization": {"status": "not_available", "identity_claims_allowed": False},
                 },
             }
