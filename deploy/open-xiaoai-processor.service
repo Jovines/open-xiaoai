@@ -1,0 +1,18 @@
+[Unit]
+Description=Open-XiaoAI household speech evidence processor
+After=network-online.target open-xiaoai-recorder.service
+Wants=network-online.target
+RequiresMountsFor=/mnt/dx4600
+
+[Service]
+Type=simple
+WorkingDirectory=%h/vscode/open-xiaoai
+EnvironmentFile=%h/.config/open-xiaoai-recorder/env
+Environment=CUDA_VISIBLE_DEVICES=
+ExecStart=%h/.venvs/qwen3-asr/bin/python %h/vscode/open-xiaoai/processor.py
+Restart=always
+RestartSec=5
+Nice=10
+
+[Install]
+WantedBy=default.target
