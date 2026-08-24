@@ -35,6 +35,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--sense-model", type=Path, default=Path(os.environ.get("SENSEVOICE_MODEL", str(Path.home() / "models/sensevoice-small/sensevoice-small-q8.gguf"))))
     parser.add_argument("--vad-model", type=Path, default=Path(os.environ.get("SENSEVOICE_VAD_MODEL", str(Path.home() / "models/sensevoice-small/fsmn-vad.gguf"))))
     parser.add_argument("--qwen-model", default=os.environ.get("QWEN_ASR_MODEL", "Qwen/Qwen3-ASR-1.7B"))
+    parser.add_argument("--diarization-python", type=Path, default=Path(os.environ.get("DIARIZATION_PYTHON", str(Path.home() / ".venvs/sherpa-onnx/bin/python"))))
+    parser.add_argument("--diarization-script", type=Path, default=Path(os.environ.get("DIARIZATION_SCRIPT", str(Path(__file__).with_name("diarize.py")))))
+    parser.add_argument("--diarization-segmentation", type=Path, default=Path(os.environ.get("DIARIZATION_SEGMENTATION_MODEL", str(Path.home() / "models/speaker-diarization/sherpa-onnx-pyannote-segmentation-3-0/model.onnx"))))
+    parser.add_argument("--diarization-embedding", type=Path, default=Path(os.environ.get("DIARIZATION_EMBEDDING_MODEL", str(Path.home() / "models/speaker-diarization/3dspeaker-zh.onnx"))))
     parser.add_argument("--zeris-url", default=os.environ.get("ZERIS_AUDIO_INGEST_URL", ""))
     parser.add_argument("--zeris-token", default=os.environ.get("ZERIS_AUDIO_INGEST_TOKEN", ""))
     parser.add_argument("--poll-seconds", type=float, default=float(os.environ.get("PROCESSOR_POLL_SECONDS", "3")))
@@ -166,6 +170,34 @@ class EvidenceProcessor:
         result = self.qwen.transcribe(str(audio), language="Chinese")
         return result[0].text.strip()
 
+    def diarize(self, audio: Path) -> tuple[list[dict], str]:
+        required = (
+            self.args.diarization_python,
+            self.args.diarization_script,
+            self.args.diarization_segmentation,
+            self.args.diarization_embedding,
+        )
+        if not all(path.is_file() for path in required):
+            return [], "models_unavailable"
+        try:
+            result = subprocess.run([
+                str(self.args.diarization_python), str(self.args.diarization_script), str(audio),
+                "--segmentation", str(self.args.diarization_segmentation),
+                "--embedding", str(self.args.diarization_embedding),
+            ], check=True, capture_output=True, text=True, timeout=180)
+            raw = json.loads(result.stdout)
+            speakers = [{
+                "speaker_id": f"recording-speaker-{int(item['speaker']):02d}",
+                "label": None,
+                "start_seconds": float(item["start_seconds"]),
+                "end_seconds": float(item["end_seconds"]),
+                "confidence": None,
+            } for item in raw]
+            return speakers, "anonymous_recording_clusters"
+        except (subprocess.SubprocessError, OSError, ValueError, KeyError, json.JSONDecodeError) as error:
+            logging.warning("说话人分离失败但不阻断原音与转写：%s", error)
+            return [], "failed"
+
     def pending_files(self) -> list[Path]:
         cutoff = time.time() - self.args.settle_seconds
         return sorted(
@@ -222,6 +254,7 @@ class EvidenceProcessor:
             texts = [text for _, text in sense_results]
             channel = choose_microphone(texts)
             primary = self.qwen_transcribe(microphones[channel])
+            speakers, diarization_status = self.diarize(microphones[channel])
             audio = audio_properties(source)
             duration = audio["duration_seconds"]
             started = parse_capture_time(source)
@@ -250,7 +283,7 @@ class EvidenceProcessor:
                     {"model": "SenseVoiceSmall", "version": "Q8-GGUF", "text": text}
                     for text in texts if text
                 ],
-                "speakers": [],
+                "speakers": speakers,
                 "reliability": {
                     "agreement": agreement,
                     "score": round(score, 4),
@@ -263,7 +296,12 @@ class EvidenceProcessor:
                     "primary_asr": {"model": "Qwen3-ASR-1.7B", "runtime": "qwen-asr", "device": "cpu", "selected_microphone": channel},
                     "cross_check": {"model": "SenseVoiceSmall-Q8", "vad": "FSMN-VAD", "all_microphone_transcripts": texts},
                     "audio": audio,
-                    "speaker_diarization": {"status": "not_available", "identity_claims_allowed": False},
+                    "speaker_diarization": {
+                        "status": diarization_status,
+                        "engine": "sherpa-onnx/pyannote-segmentation-3.0/3D-Speaker-zh",
+                        "cluster_scope": "recording_only",
+                        "identity_claims_allowed": False,
+                    },
                 },
             }
             pending = evidence_audio.with_suffix(evidence_audio.suffix + ".event.pending.json")

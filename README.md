@@ -8,7 +8,8 @@
 2. 原音以 `48 kHz / 3 通道 / 24-bit FLAC` 无损保存。硬件提供四路 PCM，其中第四路恒为零，因此不归档。
 3. `processor.py` 分别检查三支麦克风。FSMN-VAD/SenseVoice 判断没有语音的段先隔离 72 小时，核对哈希后才删除；分类清单永久留下。
 4. 有语音的整段原音进入 `evidence/`。Qwen3-ASR-1.7B 在 CPU 上生成主转写，SenseVoiceSmall 从三路麦克风独立生成候选，字符一致度只用于提示风险。
-5. 事件连同模型、运行设备、候选文本、原音 SHA-256 和 NAS 地址发给 Zeris。上报失败时保留 `.event.pending.json` 并自动重试，绝不会因此删除原音。
+5. sherpa-onnx 用 Pyannote segmentation + 中文 3D-Speaker 在 CPU 上给出仅在当前录音内有效的匿名说话人片段；它不会猜姓名、性别，也不会把不同录音的 `speaker-00` 当成同一个人。
+6. 事件连同模型、运行设备、候选文本、原音 SHA-256 和 NAS 地址发给 Zeris。上报失败时保留 `.event.pending.json` 并自动重试，绝不会因此删除原音。
 
 转写永远是 `fallible_asr`（可能听错的二手证据），不是事实。涉及时间、金额、医疗、门锁、承诺等高影响内容时，Agent 必须结合上下文、回听原音或询问家庭成员，不能仅凭转写执行。
 
@@ -32,6 +33,7 @@ sudo apt install ffmpeg openssh-client sshpass
 - `~/models/huggingface`：Qwen3-ASR-1.7B
 - `~/.local/opt/sensevoice/llama-funasr-sensevoice`
 - `~/models/sensevoice-small/{sensevoice-small-q8.gguf,fsmn-vad.gguf}`
+- `~/.venvs/sherpa-onnx` 与 `~/models/speaker-diarization/`：匿名说话人分离
 
 ## 短时测试
 
@@ -82,5 +84,5 @@ journalctl --user -u open-xiaoai-recorder.service -u open-xiaoai-processor.servi
 ## 当前边界
 
 - 三路内容高度相关，但简单求平均在实测中会降低识别效果；当前选择与其他两路结果最一致的一路给主模型，同时保留三路无损原音，后续可加入真正的阵列波束形成。
-- 数据结构已经禁止无依据的说话人身份声明，但说话人分离和声纹注册尚未接入。加入后也必须把“这一段像谁”与经本人标注的身份分开，并允许人工纠错。
+- 匿名说话人分离已经接入，但跨录音声纹聚类、声纹注册和人工姓名标注尚未接入。加入后也必须把“这一段像谁”与经本人标注的身份分开，并允许人工纠错。
 - 持续录音会采集房间内所有可听声音。启用前应确保可能被录到的人知情同意，并限制 NAS 权限、备份范围和 Zeris 访问权。
