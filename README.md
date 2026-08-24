@@ -1,92 +1,86 @@
-# Open-XiaoAI
+# Open-XiaoAI Household Audio
 
-让小爱音箱「听见你的声音」，解锁无限可能。
+这个仓库现在只做一件事：持续采集 Xiaomi 智能音箱 Pro（OH2P）的三麦克风阵列，筛掉无语音片段，并向家庭管家提供“原音 + 可疑但可追溯的中文转写”。旧的小智、MiGPT、唤醒词、对话和播放逻辑已经完全舍弃。
 
-![](./docs/images/cover.jpg)
+## 数据链路
 
-## 简介
+1. `recorder.py` 只建立一条长期 SSH/`arecord` 音频流，以准确的样本数切成 60 秒临时段；切段时不会重新连接音箱。
+2. 原音以 `48 kHz / 3 通道 / 24-bit FLAC` 无损保存。硬件提供四路 PCM，其中第四路恒为零，因此不归档。
+3. `processor.py` 分别检查三支麦克风。FSMN-VAD/SenseVoice 判断没有语音的段先隔离 72 小时，核对哈希后才删除；分类清单永久留下。
+4. 有语音的整段原音进入 `evidence/`。Qwen3-ASR-1.7B 在 CPU 上生成主转写，SenseVoiceSmall 从三路麦克风独立生成候选，字符一致度只用于提示风险。
+5. 事件连同模型、运行设备、候选文本、原音 SHA-256 和 NAS 地址发给 Zeris。上报失败时保留 `.event.pending.json` 并自动重试，绝不会因此删除原音。
 
-2017 年，当全球首款千万级销量的智能音箱诞生时，我们以为触摸到了未来。但很快发现，这些设备被困在「指令-响应」的牢笼里：
+转写永远是 `fallible_asr`（可能听错的二手证据），不是事实。涉及时间、金额、医疗、门锁、承诺等高影响内容时，Agent 必须结合上下文、回听原音或询问家庭成员，不能仅凭转写执行。
 
-- 它听得见分贝，却听不懂情感
-- 它能执行命令，却不会主动思考
-- 它有千万用户，却只有一套思维
+## 实测基线
 
-我们曾幻想中的"贾维斯"级人工智能，在现实场景中沦为"天气预报+音乐播放器"。
+- 10 秒中文家庭录音：Qwen3-ASR-1.7B 纯 CPU 推理约 6.3 秒，模型常驻约 13 GB RAM；GPU 不参与。
+- SenseVoiceSmall-Q8 同一录音约 0.5 秒、约 300 MB RAM，适合 VAD 和异构复核。
+- 10 秒三通道无损 FLAC 约 3.3 MiB，即未经筛选约 28–30 GiB/天。NAS 临时承接全部原音，处理成功后只长期保留含语音的证据段。
 
-**真正的智能不应被预设的代码逻辑所束缚，而应像生命体般在交互中进化。**
+数字是当前 i7-12700 主机上的一次实测，不是性能承诺。N5105 小主机内存不足以舒适常驻 1.7B float32 模型，因此转写服务部署在当前主机，Zeris 仍运行在小主机。
 
-在上一个 [MiGPT](https://github.com/idootop/mi-gpt) 项目中，我们已经实现将 ChatGPT 接入到小爱音箱。
+## 依赖与模型
 
-这一次 [Open-XiaoAI](https://github.com/idootop/open-xiaoai) 再次进化，直接接管小爱音箱的“耳朵”和“嘴巴”，
+```bash
+sudo apt install ffmpeg openssh-client sshpass
+```
 
-通过多模态大模型和 AI Agent，将小爱音箱的潜力完全释放，解锁无限可能。
+处理器使用：
 
-**未来由你定义!**
+- `~/.venvs/qwen3-asr`：CPU 版 PyTorch 和 `qwen-asr`
+- `~/models/huggingface`：Qwen3-ASR-1.7B
+- `~/.local/opt/sensevoice/llama-funasr-sensevoice`
+- `~/models/sensevoice-small/{sensevoice-small-q8.gguf,fsmn-vad.gguf}`
 
-## 你的声音 + 小爱音箱 = 无限可能
+## 短时测试
 
-👉 [小爱音箱接入小智 AI 演示视频](https://www.bilibili.com/video/BV1TxJhzvEhz)
+```bash
+cd ~/vscode/open-xiaoai
+SSHPASS=open-xiaoai python3 recorder.py \
+  --segment-seconds 10 \
+  --max-segments 1 \
+  --output-dir /tmp/open-xiaoai-test
+```
 
-[![](./docs/images/xiaozhi.jpg)](https://www.bilibili.com/video/BV1TxJhzvEhz)
+录音会从音箱的 `hw:0,3`/`noop` PCM 设备读取四路 S32_LE，并修正 A113 将有效 24 位样本放在 S32 低位的布局。默认输出目录为 `~/recordings/open-xiaoai`；生产配置改到 NAS 的 `inbox/`。
 
-👉 [小爱音箱自定义唤醒词演示视频](https://www.bilibili.com/video/BV1YfVUz5EMj)
+主要录音变量：
 
-[![](./docs/images/kws.jpg)](https://www.bilibili.com/video/BV1YfVUz5EMj)
+| 变量 | 默认值 | 说明 |
+|---|---:|---|
+| `RECORDER_HOST` | `192.168.8.242` | 音箱 IP |
+| `RECORDER_OUTPUT_DIR` | `~/recordings/open-xiaoai` | 临时原音目录 |
+| `RECORDER_SEGMENT_SECONDS` | `60` | 临时段秒数 |
+| `RECORDER_SAMPLE_RATE` | `48000` | 采样率 |
+| `RECORDER_ARCHIVE_CHANNELS` | `3` | 三路有效麦克风 |
+| `RECORDER_CODEC` | `flac` | 生产使用无损 FLAC |
+| `RECORDER_MIN_FREE_GB` | `5` | 低磁盘余量时暂停 |
+| `SSHPASS` | 无 | 音箱 SSH 密码；推荐最终换成密钥 |
 
-👉 [小爱音箱接入 MiGPT 演示视频](https://www.bilibili.com/video/BV1N1421y7qn)
+处理变量见 `.env.example`。真实 SSH 密码和 `ZERIS_AUDIO_INGEST_TOKEN` 只放在权限为 `600` 的本机环境文件，不能提交。
 
-[![](./docs/images/migpt.jpg)](https://www.bilibili.com/video/BV1N1421y7qn)
+## systemd 用户服务
 
-## 快速开始
+```bash
+mkdir -p ~/.config/open-xiaoai-recorder ~/.config/systemd/user
+cp .env.example ~/.config/open-xiaoai-recorder/env
+chmod 600 ~/.config/open-xiaoai-recorder/env
+# 编辑 env，填入 SSHPASS 和与 Zeris 相同的随机 token
+cp deploy/open-xiaoai-{recorder,processor}.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now open-xiaoai-recorder.service open-xiaoai-processor.service
+```
 
-> [!IMPORTANT]
-> 本教程仅适用于 **小爱音箱 Pro（LX06）** 和 **Xiaomi 智能音箱 Pro（OH2P）** 这两款机型，**其他型号**的小爱音箱请勿直接使用！🚨
+```bash
+systemctl --user status open-xiaoai-recorder.service open-xiaoai-processor.service
+journalctl --user -u open-xiaoai-recorder.service -u open-xiaoai-processor.service -f
+```
 
-本项目由 Client 端 + Server 端两部分组成，你可以按照以下顺序运行该项目：
+两个服务都要求 `/mnt/dx4600` 是真实挂载点。NAS 掉线时录音和清理均停止，不会悄悄写进系统盘。
 
-1. 刷机更新小爱音箱补丁固件，开启并 SSH 连接到小爱音箱 👉 [教程](docs/flash.md)
-2. 在小爱音箱上安装运行 Client 端补丁程序 👉 [教程](packages/client-rust/README.md)
-3. 运行以下演示程序，体验小爱音箱的全新能力 ✨
-   - 👉 [小爱音箱接入小智 AI](examples/xiaozhi/README.md)
-   - 👉 [小爱音箱自定义唤醒词](examples/kws/README.md)
-   - 👉 [小爱音箱接入 MiGPT（完美版）](examples/migpt/README.md)
-   - 👉 [小爱音箱接入 Gemini Live API](examples/gemini/README.md)
+## 当前边界
 
-以上皆为抛砖引玉，你也可以亲手编写自己想要的功能，一切由你定义！
-
-## 相关项目
-
-> [!TIP]
-> 技术的意义在于分享与共创。如果你打算或正在使用本项目做些有趣的事情，
-> 欢迎提交 PR 或 issue 分享你的项目和创意。✨
-
-如果你不想刷机，或者不是小爱音箱 Pro，下面的项目或许对你有用：
-
-- https://github.com/idootop/mi-gpt
-- https://github.com/idootop/migpt-next
-- https://github.com/yihong0618/xiaogpt
-- https://github.com/hanxi/xiaomusic
-
-## 参考链接
-
-如果你想要了解更多技术细节，下面的链接可能对你有用：
-
-- https://github.com/yihong0618/gitblog/issues/258
-- https://github.com/jialeicui/open-lx01
-- https://github.com/duhow/xiaoai-patch
-- https://javabin.cn/2021/xiaoai_fm.html
-- https://xuanxuanblingbling.github.io/iot/2022/09/16/mi/
-
-## 免责声明
-
-1. **适用范围**
-   本项目为开源非营利项目，仅供学术研究或个人测试用途。严禁用于商业服务、网络攻击、数据窃取、系统破坏等违反《网络安全法》及使用者所在地司法管辖区的法律规定的场景。
-2. **非官方声明**
-   本项目由第三方开发者独立开发，与小米集团及其关联方（下称"权利方"）无任何隶属/合作关系，亦未获其官方授权/认可或技术支持。项目中涉及的商标、固件、云服务的所有权利归属小米集团。若权利方主张权益，使用者应立即主动停止使用并删除本项目。
-
-继续下载或运行本项目，即表示您已完整阅读并同意[用户协议](agreement.md)，否则请立即终止使用并彻底删除本项目。
-
-## License
-
-[MIT](LICENSE) License © 2024-PRESENT Del Wang
+- 三路内容高度相关，但简单求平均在实测中会降低识别效果；当前选择与其他两路结果最一致的一路给主模型，同时保留三路无损原音，后续可加入真正的阵列波束形成。
+- 数据结构已经禁止无依据的说话人身份声明，但说话人分离和声纹注册尚未接入。加入后也必须把“这一段像谁”与经本人标注的身份分开，并允许人工纠错。
+- 持续录音会采集房间内所有可听声音。启用前应确保可能被录到的人知情同意，并限制 NAS 权限、备份范围和 Zeris 访问权。
