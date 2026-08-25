@@ -13,6 +13,7 @@ import platform
 import re
 import resource
 import subprocess
+import sys
 import tempfile
 import time
 import unicodedata
@@ -153,6 +154,57 @@ class SenseVoiceEngine:
         return " ".join(lines)
 
 
+class FunAsrNanoEngine:
+    name = "fun-asr-nano-2512-q8-cpu"
+
+    def __init__(self, binary: Path, encoder: Path, llm: Path, vad: Path) -> None:
+        self.binary, self.encoder, self.llm, self.vad = binary, encoder, llm, vad
+        for path in (binary, encoder, llm, vad):
+            if not path.is_file():
+                raise FileNotFoundError(path)
+        # The current CLI is one process per recording, so its model startup is
+        # intentionally included in runtime/RTF instead of hidden here.
+        self.load_seconds = 0.0
+
+    def transcribe(self, audio: Path) -> str:
+        result = subprocess.run(
+            [
+                str(self.binary), "--enc", str(self.encoder), "-m", str(self.llm),
+                "--vad", str(self.vad), "-a", str(audio),
+            ],
+            check=True, capture_output=True, text=True,
+        )
+        return " ".join(line.strip() for line in result.stdout.splitlines() if line.strip())
+
+
+class FireRedEngine:
+    name = "fireredasr2-aed-cpu-fp32"
+
+    def __init__(self, source_dir: Path, deps_dir: Path, model_dir: Path) -> None:
+        required = (source_dir / "fireredasr2s/fireredasr2/asr.py", model_dir / "model.pth.tar")
+        for path in required:
+            if not path.is_file():
+                raise FileNotFoundError(path)
+        if not deps_dir.is_dir():
+            raise FileNotFoundError(deps_dir)
+        sys.path.insert(0, str(deps_dir))
+        sys.path.insert(0, str(source_dir))
+        os.environ["CUDA_VISIBLE_DEVICES"] = ""
+        import torch
+        from fireredasr2s.fireredasr2 import FireRedAsr2, FireRedAsr2Config
+        torch.set_num_threads(max(1, min(16, os.cpu_count() or 1)))
+        started = time.perf_counter()
+        self.model = FireRedAsr2.from_pretrained(
+            "aed", str(model_dir),
+            FireRedAsr2Config(use_gpu=False, use_half=False, beam_size=3, nbest=1),
+        )
+        self.load_seconds = time.perf_counter() - started
+
+    def transcribe(self, audio: Path) -> str:
+        results = self.model.transcribe([audio.stem], [str(audio)])
+        return results[0]["text"].strip() if results else ""
+
+
 class QwenEngine:
     name = "qwen3-asr-1.7b-cpu-fp32"
 
@@ -230,7 +282,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="可重复的中文 ASR micro-CER/关键词/性能评测")
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--audio-root", type=Path, required=True)
-    parser.add_argument("--engine", action="append", choices=("qwen", "sensevoice"), required=True)
+    parser.add_argument("--engine", action="append", choices=("qwen", "sensevoice", "funasr-nano", "firered"), required=True)
     parser.add_argument("--repeat", type=int, default=1)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--qwen-model", default=os.environ.get("QWEN_ASR_MODEL", "Qwen/Qwen3-ASR-1.7B"))
@@ -238,6 +290,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sense-binary", type=Path, default=Path(os.environ.get("SENSEVOICE_BINARY", str(Path.home() / ".local/opt/sensevoice/llama-funasr-sensevoice"))))
     parser.add_argument("--sense-model", type=Path, default=Path(os.environ.get("SENSEVOICE_MODEL", str(Path.home() / "models/sensevoice-small/sensevoice-small-q8.gguf"))))
     parser.add_argument("--sense-vad", type=Path, default=Path(os.environ.get("SENSEVOICE_VAD_MODEL", str(Path.home() / "models/sensevoice-small/fsmn-vad.gguf"))))
+    parser.add_argument("--funasr-binary", type=Path, default=Path(os.environ.get("FUNASR_NANO_BINARY", str(Path.home() / ".local/opt/sensevoice/llama-funasr-cli"))))
+    parser.add_argument("--funasr-encoder", type=Path, default=Path(os.environ.get("FUNASR_NANO_ENCODER", str(Path.home() / "models/fun-asr-nano/funasr-encoder-f16.gguf"))))
+    parser.add_argument("--funasr-llm", type=Path, default=Path(os.environ.get("FUNASR_NANO_LLM", str(Path.home() / "models/fun-asr-nano/qwen3-0.6b-q8_0.gguf"))))
+    parser.add_argument("--funasr-vad", type=Path, default=Path(os.environ.get("FUNASR_NANO_VAD", str(Path.home() / "models/fun-asr-nano/fsmn-vad.gguf"))))
+    parser.add_argument("--firered-source-dir", type=Path, default=Path(os.environ.get("FIRERED_ASR_SOURCE_DIR", str(Path.home() / ".local/opt/fireredasr2s"))))
+    parser.add_argument("--firered-deps-dir", type=Path, default=Path(os.environ.get("FIRERED_ASR_DEPS_DIR", str(Path.home() / ".local/opt/fireredasr2-deps-py312"))))
+    parser.add_argument("--firered-model-dir", type=Path, default=Path(os.environ.get("FIRERED_ASR_MODEL_DIR", str(Path.home() / "models/fireredasr2-aed"))))
     args = parser.parse_args()
     if args.repeat < 1:
         parser.error("--repeat 必须大于 0")
@@ -251,6 +310,10 @@ def main() -> int:
     for name in dict.fromkeys(args.engine):
         if name == "sensevoice":
             engines.append(SenseVoiceEngine(args.sense_binary, args.sense_model, args.sense_vad))
+        elif name == "funasr-nano":
+            engines.append(FunAsrNanoEngine(args.funasr_binary, args.funasr_encoder, args.funasr_llm, args.funasr_vad))
+        elif name == "firered":
+            engines.append(FireRedEngine(args.firered_source_dir, args.firered_deps_dir, args.firered_model_dir))
         else:
             engines.append(QwenEngine(args.qwen_model, args.qwen_max_new_tokens))
     all_results, summaries, qualities = {}, {}, {}

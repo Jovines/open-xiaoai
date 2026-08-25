@@ -3,6 +3,7 @@ import hashlib
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 from evaluation import asr_benchmark
 
@@ -60,6 +61,23 @@ class ManifestTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, "哈希不符"):
                 asr_benchmark.resolve_audio({"audio": "sample.wav", "sha256": "0" * 64}, root)
+
+
+class EngineTests(unittest.TestCase):
+    def test_funasr_nano_uses_separate_encoder_llm_and_vad(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths = [root / name for name in ("binary", "encoder", "llm", "vad", "audio.wav")]
+            for path in paths:
+                path.write_bytes(b"x")
+            engine = asr_benchmark.FunAsrNanoEngine(*paths[:4])
+            completed = mock.Mock(stdout="第一行\n第二行\n", stderr="logs")
+            with mock.patch("evaluation.asr_benchmark.subprocess.run", return_value=completed) as run:
+                self.assertEqual(engine.transcribe(paths[4]), "第一行 第二行")
+            command = run.call_args.args[0]
+            self.assertEqual(command[:6], [str(paths[0]), "--enc", str(paths[1]), "-m", str(paths[2]), "--vad"])
+            self.assertIn(str(paths[3]), command)
+            self.assertIn(str(paths[4]), command)
 
 
 if __name__ == "__main__":
