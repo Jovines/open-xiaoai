@@ -14,6 +14,8 @@
 
 转写永远是 `fallible_asr`（可能听错的二手证据），不是事实。涉及时间、金额、医疗、门锁、承诺等高影响内容时，Agent 必须结合上下文、回听原音或询问家庭成员，不能仅凭转写执行。
 
+当前采集端尚未归档音箱自身的播放 PCM，因此事件会明确携带 `acoustic_scene.scene_type=unknown`、`playback_reference.available=false`，不会凭音色把小爱回答冒充成家庭成员的话。设备已经确认存在默认播放流镜像（`pcm.vis` → `/tmp/vis_audio.fifo`）；后续接入同步 `playback_refs[]` 后，Zeris 可按 `human | xiaoai_output | overlap | unknown` 形成可回听的人机对话 turn。
+
 ## 实测基线
 
 - 10 秒中文家庭录音：Qwen3-ASR-1.7B 纯 CPU 推理约 6.3 秒，模型常驻约 13 GB RAM；GPU 不参与。
