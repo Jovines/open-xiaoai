@@ -24,6 +24,14 @@ FILENAME_TIME = re.compile(r"^(\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}_[+-]\d{4})")
 SUPPORTED_AUDIO = {".flac", ".wav", ".ogg"}
 
 
+class EventPostError(RuntimeError):
+    """An ingest failure with enough information to decide whether to retry."""
+
+    def __init__(self, message: str, *, retryable: bool) -> None:
+        super().__init__(message)
+        self.retryable = retryable
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="筛掉无语音录音，并生成可回听、可审计的中文转写证据")
     parser.add_argument("--input-dir", type=Path, default=Path(os.environ.get("PROCESSOR_INPUT_DIR", "/mnt/dx4600/家庭管家/录音/inbox")))
@@ -135,6 +143,8 @@ class EvidenceProcessor:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
         self.qwen = None
+        self.pending_retry_attempts: dict[Path, int] = {}
+        self.pending_retry_after: dict[Path, float] = {}
 
     def require_runtime(self) -> None:
         if not self.args.required_mount.is_mount():
@@ -209,7 +219,89 @@ class EvidenceProcessor:
         captured = parse_capture_time(source)
         return Path(captured.strftime("%Y/%m/%d")) / source.name
 
+    def quarantine_audio(
+        self,
+        source: Path,
+        *,
+        classification: str,
+        classifier: dict,
+        pending_event: Path | None = None,
+    ) -> Path:
+        """Move an unhelpful recording to recoverable quarantine with an audit record."""
+        digest = sha256_file(source)
+        relative = self.relative_destination(source)
+        quarantine = self.args.discard_dir / relative.with_suffix(relative.suffix + ".quarantine")
+        manifest = self.args.discard_dir / relative.with_suffix(".json")
+        quarantine.parent.mkdir(parents=True, exist_ok=True)
+        if quarantine.exists() or manifest.exists():
+            raise RuntimeError(f"隔离目标已存在，拒绝覆盖：{quarantine}")
+        source.replace(quarantine)
+
+        rejected_event = None
+        if pending_event is not None and pending_event.is_file():
+            rejected_event = quarantine.with_suffix(quarantine.suffix + ".event.rejected")
+            pending_event.replace(rejected_event)
+
+        classified_at = dt.datetime.now(dt.timezone.utc)
+        record = {
+            "schema_version": 1,
+            "classification": classification,
+            "source_sha256": digest,
+            "source_bytes": quarantine.stat().st_size,
+            "classified_at": classified_at.isoformat(),
+            "delete_after": (classified_at + dt.timedelta(hours=self.args.discard_grace_hours)).isoformat(),
+            "quarantine_audio": quarantine.name,
+            "classifier": classifier,
+        }
+        if rejected_event is not None:
+            record["rejected_event"] = rejected_event.name
+        atomic_json(manifest, record)
+        logging.info("%s，已隔离 %s 小时后再删除：%s", classification, self.args.discard_grace_hours, quarantine)
+        return quarantine
+
+    @staticmethod
+    def is_single_channel_false_positive(event: dict) -> bool:
+        """Recognize the known fan-noise failure: empty primary plus <=1 active mic."""
+        if str(event.get("transcript", "")).strip():
+            return False
+        transcripts = (
+            event.get("provenance", {})
+            .get("cross_check", {})
+            .get("all_microphone_transcripts", [])
+        )
+        return (
+            isinstance(transcripts, list)
+            and len(transcripts) == 3
+            and sum(bool(str(text).strip()) for text in transcripts) <= 1
+        )
+
+    @staticmethod
+    def pending_audio_path(pending: Path) -> Path:
+        suffix = ".event.pending.json"
+        if not pending.name.endswith(suffix):
+            raise ValueError(f"不是 pending 事件文件：{pending}")
+        return pending.with_name(pending.name.removesuffix(suffix))
+
+    def defer_pending(self, pending: Path, error: Exception) -> None:
+        attempts = self.pending_retry_attempts.get(pending, 0) + 1
+        delay = min(900.0, 15.0 * (2 ** min(attempts - 1, 6)))
+        self.pending_retry_attempts[pending] = attempts
+        self.pending_retry_after[pending] = time.monotonic() + delay
+        logging.warning("事件暂未上报，%.0f 秒后重试（第 %d 次）：%s：%s", delay, attempts, pending, error)
+
+    def finish_pending(self, pending: Path) -> None:
+        self.pending_retry_attempts.pop(pending, None)
+        self.pending_retry_after.pop(pending, None)
+
+    def reject_pending(self, pending: Path, error: Exception) -> None:
+        rejected = Path(str(pending).replace(".event.pending.json", ".event.rejected.json"))
+        pending.replace(rejected)
+        self.finish_pending(pending)
+        logging.error("事件被永久拒绝，原音保留供人工复核：%s：%s", rejected, error)
+
     def post_event(self, event: dict) -> None:
+        if not str(event.get("transcript", "")).strip():
+            raise EventPostError("事件缺少有效 transcript", retryable=False)
         if not self.args.zeris_url:
             logging.warning("未配置 Zeris URL；证据保留为 pending，不会丢失")
             return
@@ -222,38 +314,50 @@ class EvidenceProcessor:
         try:
             with urllib.request.urlopen(request, timeout=15) as response:
                 if response.status not in (200, 201):
-                    raise RuntimeError(f"Zeris 返回 HTTP {response.status}")
+                    raise EventPostError(f"Zeris 返回 HTTP {response.status}", retryable=response.status >= 500)
+        except urllib.error.HTTPError as error:
+            try:
+                detail = error.read().decode("utf-8", errors="replace")[:500]
+            except OSError:
+                detail = ""
+            retryable = error.code >= 500 or error.code in (408, 425, 429)
+            message = f"Zeris 返回 HTTP {error.code}"
+            if detail:
+                message += f"：{detail}"
+            raise EventPostError(message, retryable=retryable) from error
         except (urllib.error.URLError, TimeoutError) as error:
-            raise RuntimeError(f"Zeris 上报失败：{error}") from error
+            raise EventPostError(f"Zeris 上报失败：{error}", retryable=True) from error
 
     def process_file(self, source: Path) -> str:
         with tempfile.TemporaryDirectory(prefix="open-xiaoai-process-") as temporary:
             microphones = extract_microphones(source, Path(temporary))
             sense_results = [sensevoice(self.args.sense_binary, self.args.sense_model, self.args.vad_model, audio) for audio in microphones]
             if not any(segments > 0 and text for segments, text in sense_results):
-                digest = sha256_file(source)
-                relative = self.relative_destination(source)
-                quarantine = self.args.discard_dir / relative.with_suffix(relative.suffix + ".quarantine")
-                discarded = self.args.discard_dir / relative.with_suffix(".json")
-                quarantine.parent.mkdir(parents=True, exist_ok=True)
-                source.replace(quarantine)
-                classified_at = dt.datetime.now(dt.timezone.utc)
-                atomic_json(discarded, {
-                    "schema_version": 1,
-                    "classification": "no_speech",
-                    "source_sha256": digest,
-                    "source_bytes": quarantine.stat().st_size,
-                    "classified_at": classified_at.isoformat(),
-                    "delete_after": (classified_at + dt.timedelta(hours=self.args.discard_grace_hours)).isoformat(),
-                    "quarantine_audio": quarantine.name,
-                    "classifier": {"model": "SenseVoiceSmall-Q8", "vad": "FSMN-VAD", "channels_checked": 3},
-                })
-                logging.info("无语音，已隔离 %s 小时后再删除：%s", self.args.discard_grace_hours, quarantine)
+                self.quarantine_audio(
+                    source,
+                    classification="no_speech",
+                    classifier={"model": "SenseVoiceSmall-Q8", "vad": "FSMN-VAD", "channels_checked": 3},
+                )
                 return "discarded"
 
             texts = [text for _, text in sense_results]
             channel = choose_microphone(texts)
             primary = self.qwen_transcribe(microphones[channel])
+            active_channels = sum(bool(text.strip()) for text in texts)
+            if not primary and active_channels <= 1:
+                self.quarantine_audio(
+                    source,
+                    classification="no_reliable_speech",
+                    classifier={
+                        "primary_model": "Qwen3-ASR-1.7B",
+                        "primary_transcript_empty": True,
+                        "cross_check_model": "SenseVoiceSmall-Q8",
+                        "vad": "FSMN-VAD",
+                        "active_channels": active_channels,
+                        "channels_checked": 3,
+                    },
+                )
+                return "discarded"
             speakers, diarization_status = self.diarize(microphones[channel])
             audio = audio_properties(source)
             duration = audio["duration_seconds"]
@@ -306,9 +410,17 @@ class EvidenceProcessor:
             }
             pending = evidence_audio.with_suffix(evidence_audio.suffix + ".event.pending.json")
             atomic_json(pending, event)
-            self.post_event(event)
+            try:
+                self.post_event(event)
+            except EventPostError as error:
+                if error.retryable:
+                    self.defer_pending(pending, error)
+                    return "pending"
+                self.reject_pending(pending, error)
+                return "rejected"
             if self.args.zeris_url:
                 pending.replace(evidence_audio.with_suffix(evidence_audio.suffix + ".event.json"))
+                self.finish_pending(pending)
             logging.info("已保留语音证据：%s（模型一致度 %.3f）", evidence_audio, score)
             return "evidence"
 
@@ -317,10 +429,37 @@ class EvidenceProcessor:
             return 0
         sent = 0
         for pending in sorted(self.args.evidence_dir.rglob("*.event.pending.json")):
-            event = json.loads(pending.read_text(encoding="utf-8"))
-            self.post_event(event)
-            pending.replace(Path(str(pending).replace(".event.pending.json", ".event.json")))
-            sent += 1
+            if self.pending_retry_after.get(pending, 0.0) > time.monotonic():
+                continue
+            try:
+                event = json.loads(pending.read_text(encoding="utf-8"))
+                if self.is_single_channel_false_positive(event):
+                    audio = self.pending_audio_path(pending)
+                    if audio.is_file():
+                        self.quarantine_audio(
+                            audio,
+                            classification="no_reliable_speech",
+                            classifier={
+                                "primary_model": "Qwen3-ASR-1.7B",
+                                "primary_transcript_empty": True,
+                                "cross_check_model": "SenseVoiceSmall-Q8",
+                                "reason": "recovered_single_channel_false_positive",
+                            },
+                            pending_event=pending,
+                        )
+                        self.finish_pending(pending)
+                        continue
+                self.post_event(event)
+                pending.replace(Path(str(pending).replace(".event.pending.json", ".event.json")))
+                self.finish_pending(pending)
+                sent += 1
+            except EventPostError as error:
+                if error.retryable:
+                    self.defer_pending(pending, error)
+                else:
+                    self.reject_pending(pending, error)
+            except Exception as error:
+                self.defer_pending(pending, error)
         return sent
 
     def purge_expired_quarantine(self) -> int:
@@ -353,8 +492,11 @@ class EvidenceProcessor:
                     logging.info("已删除 %d 个过期的无语音隔离段", removed)
                 self.retry_pending_events()
                 for source in self.pending_files():
-                    self.process_file(source)
-                    processed += 1
+                    try:
+                        self.process_file(source)
+                        processed += 1
+                    except Exception:
+                        logging.exception("单个录音处理失败，已保留并继续后续文件：%s", source)
                     if self.args.max_files and processed >= self.args.max_files:
                         return 0
             except Exception:
