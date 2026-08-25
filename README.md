@@ -14,7 +14,9 @@
 
 转写永远是 `fallible_asr`（可能听错的二手证据），不是事实。涉及时间、金额、医疗、门锁、承诺等高影响内容时，Agent 必须结合上下文、回听原音或询问家庭成员，不能仅凭转写执行。
 
-当前采集端尚未归档音箱自身的播放 PCM，因此事件会明确携带 `acoustic_scene.scene_type=unknown`、`playback_reference.available=false`，不会凭音色把小爱回答冒充成家庭成员的话。设备已经确认存在默认播放流镜像（`pcm.vis` → `/tmp/vis_audio.fifo`）；后续接入同步 `playback_refs[]` 后，Zeris 可按 `human | xiaoai_output | overlap | unknown` 形成可回听的人机对话 turn。
+播放 reference canary 已从默认 PCM 的 `pcm.vis` 旁路无损归档到 NAS；处理器会把与麦克风事件重叠的 `playback_refs[]` 交给 Zeris，并按 `human | xiaoai_output | unknown` 形成保守 turn。受控“小爱问答 + 播放时插话”验收完成前，重叠近端声音不会冒充已确认的 `overlap`；没有 reference 的事件仍明确标为 `acoustic_scene.scene_type=unknown`、`playback_reference.available=false`。
+
+OH2P 声卡拓扑、原厂进程边界、播放 fan-out 协议、内核兼容踩坑、验收与回滚门禁统一记录在 [`docs/oh2p-audio-integration.md`](docs/oh2p-audio-integration.md)。经验文档是后续实现的依据，不能只留在聊天记录里。
 
 ## 实测基线
 
