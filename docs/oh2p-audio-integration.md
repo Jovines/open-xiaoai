@@ -11,7 +11,7 @@
 - 三个通道包含有效阵列麦克风信号；第四通道在实测中恒为零，所以长期证据保存前三路 `48 kHz / 24-bit FLAC`。不能把旧 LX06 配置里的 `mic_num=6; ref_num=1` 直接当作 OH2P 原始采集通道布局。
 - 原厂 `/usr/bin/mipns-xiaomi` 同时持有 `pcmC0D3c` 与 `pcmC0D2p`，并加载 `libmdspeech.so`、`libvpm.so`。二进制包含 AEC latency 与 VPM dump 相关符号，说明原厂语音链内部有回声处理；这不等于已有可供我们归档的 AEC reference API。
 - 默认播放 PCM 是 `pcm.!default -> pcm.vis -> pcm.tocopy -> pcm.Playback -> pcm.dmixer -> hw:0,2`。`pcm.vis` 的 file 插件执行 `safe_fifo /tmp/vis_audio.fifo /tmp/mis_audio.fifo`，后者被 `misound_service` 消费用于灯效。观察到的 `safe_fifo` stdin 是 ALSA file 插件创建的 pipe。
-- 上述播放镜像已证明存在，但在完成一次受控“小爱问答 + reference 采集”前，不能声称它覆盖小爱回答、全部提示音和所有媒体路径。部分原厂进程可能直接打开命名 PCM；覆盖率必须实测。
+- 上述播放镜像已覆盖一次通过小爱原生 TTS 发起的受控播报；全部提示音、音乐、蓝牙等路径仍须逐项实测。部分原厂进程可能直接打开命名 PCM，不能用一次 TTS 成功推断所有播放路径都已覆盖。
 - Home Assistant 中音量、静音、播放状态当前均为 `unavailable`，不能作为可靠的唯一来源归因信号。
 
 ## 为什么不注入原厂进程
@@ -34,6 +34,10 @@
 本机测试覆盖：旁路 reader 缺失时主输出字节完全一致；旁路存在时完整帧与尾帧的 magic、版本、stream id、序号、时间戳、长度和 flag 正确。
 
 2026-08-25 canary 已用 `/data/open-xiaoai/audio-reference/asound.conf.canary` bind mount 到 `/etc/asound.conf`，未覆盖系统文件，只重启 `mediaplayer`，未重启 `mipns-xiaomi`。设备 `/tmp` 随机 payload 对拍：主路 3840 bytes 逐字节一致，旁路两帧 3920 bytes。随后 7 秒数字静音首次连接捕获 1.870 秒，说明 receiver 冷启动可能错过前段；连接保持后再次播放 1 秒数字静音，完整归档 1.010 秒、0 丢帧。麦克风 recorder、processor、playback recorder 三项服务全程 active。canary 尚未设为重启后持久启用。
+
+同日 11:44 的原生 TTS 可听测试进一步验证了真实链路：reference 完整归档 2.930 秒、293 个 10 ms 包、0 丢帧，三路麦克风均捕获到一致的外放波形，处理器把同一 reference 的 NAS URI、SHA-256 和事件内偏移附到了语音证据。三路互相关峰值位置相差不超过 0.13 ms，说明阵列录音与 reference 可稳定对齐；但默认 PCM 的数字旁路约比麦克风收到的真实外放提前 1.95 秒，后续 AEC/归因必须估计并补偿播放缓冲延迟，不能只比较设备时间戳的瞬时重叠。
+
+这次受控句也再次证明“有 reference”不等于“ASR 文本可靠”：目标句中的“原有”被 Qwen3-ASR-1.7B 识别成“仍有”。当前保留原音、模型候选、`fallible_asr` 标记和 `needs_review` 的策略是必要的。因为尚未执行播放时真人插话，处理器把麦克风与播放重叠段保守标为 `unknown + aec_not_yet_applied`，没有误报为已确认的 `overlap`。
 
 ## 构建兼容性经验
 
