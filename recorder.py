@@ -22,6 +22,7 @@ import time
 DEFAULT_SAMPLE_RATE = 48_000
 DEFAULT_CAPTURE_CHANNELS = 4
 DEFAULT_ARCHIVE_CHANNELS = 3
+DEFAULT_PCM_GAIN = 96.0
 CAPTURE_FORMAT = "S32_LE"
 CAPTURE_PCM = "noop"
 MIN_VALID_FILE_SIZE = 1_024
@@ -54,6 +55,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=[1, 3],
         default=env_int("RECORDER_ARCHIVE_CHANNELS", DEFAULT_ARCHIVE_CHANNELS),
         help="保存一路麦克风或三路有效阵列通道，默认 3",
+    )
+    parser.add_argument(
+        "--pcm-gain",
+        type=float,
+        default=env_float("RECORDER_PCM_GAIN", DEFAULT_PCM_GAIN),
+        help="A113 低位样本映射增益；默认 96，给突发声音保留约 8.5 dB 余量",
     )
     parser.add_argument(
         "--host",
@@ -138,6 +145,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--segment-seconds 必须大于 0")
     if args.sample_rate not in (16_000, 48_000):
         parser.error("--sample-rate 当前仅支持 16000 或 48000")
+    if not 0 < args.pcm_gain <= 256:
+        parser.error("--pcm-gain 必须大于 0 且不超过 256")
     if args.retry_seconds < 0:
         parser.error("--retry-seconds 不能小于 0")
     if args.retention_days < 0:
@@ -199,13 +208,14 @@ def build_ffmpeg_command(
         str(DEFAULT_CAPTURE_CHANNELS),
         "-i",
         "pipe:0",
-        # A113 PDM samples occupy the lower 24 bits of each S32 sample.
-        # Multiplying by 256 is equivalent to the corrected sample mapping.
+        # A113 PDM samples occupy the lower 24 bits of each S32 sample. A gain of
+        # 256 maps them to full scale but clips nearby loudspeaker playback in
+        # practice, so production defaults to 96 (about 8.5 dB headroom).
         "-af",
         (
-            "volume=256,pan=mono|c0=c0"
+            f"volume={args.pcm_gain:g},pan=mono|c0=c0"
             if args.archive_channels == 1
-            else "volume=256,pan=3.0|FL=c0|FR=c1|FC=c2"
+            else f"volume={args.pcm_gain:g},pan=3.0|FL=c0|FR=c1|FC=c2"
         ),
     ]
     if args.codec == "opus":

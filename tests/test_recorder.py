@@ -18,6 +18,7 @@ def make_args(**overrides):
         "required_mount": None,
         "sample_rate": 48000,
         "archive_channels": 3,
+        "pcm_gain": 96.0,
         "segment_seconds": 3600,
         "codec": "opus",
         "bitrate": "96k",
@@ -47,9 +48,9 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(command[0], "ssh")
         self.assertIn("BatchMode=yes", command)
 
-    def test_ffmpeg_applies_a113_sample_correction(self):
+    def test_ffmpeg_applies_a113_sample_correction_with_headroom(self):
         command = recorder.build_ffmpeg_command(make_args(), Path("capture.part"))
-        self.assertIn("volume=256,pan=3.0|FL=c0|FR=c1|FC=c2", command)
+        self.assertIn("volume=96,pan=3.0|FL=c0|FR=c1|FC=c2", command)
         self.assertIn("libopus", command)
         self.assertIn("96k", command)
 
@@ -57,7 +58,22 @@ class CommandTests(unittest.TestCase):
         command = recorder.build_ffmpeg_command(
             make_args(archive_channels=1), Path("capture.part")
         )
-        self.assertIn("volume=256,pan=mono|c0=c0", command)
+        self.assertIn("volume=96,pan=mono|c0=c0", command)
+
+    def test_gain_can_be_raised_for_controlled_diagnostics(self):
+        command = recorder.build_ffmpeg_command(
+            make_args(pcm_gain=256.0), Path("capture.part")
+        )
+        self.assertIn("volume=256,pan=3.0|FL=c0|FR=c1|FC=c2", command)
+
+    def test_default_gain_leaves_headroom(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            args = recorder.parse_args([])
+        self.assertEqual(args.pcm_gain, 96.0)
+
+    def test_gain_above_sample_mapping_limit_is_rejected(self):
+        with self.assertRaises(SystemExit):
+            recorder.parse_args(["--pcm-gain", "257"])
 
     def test_lossless_mode_preserves_24_bit_samples(self):
         command = recorder.build_ffmpeg_command(
