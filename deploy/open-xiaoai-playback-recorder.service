@@ -1,0 +1,17 @@
+[Unit]
+Description=Open-XiaoAI playback reference recorder
+After=network-online.target
+Wants=network-online.target
+RequiresMountsFor=/mnt/dx4600
+
+[Service]
+Type=simple
+WorkingDirectory=%h/vscode/open-xiaoai
+EnvironmentFile=%h/.config/open-xiaoai-recorder/env
+EnvironmentFile=%h/.config/open-xiaoai-recorder/playback.env
+ExecStart=/usr/bin/python3 %h/vscode/open-xiaoai/playback_recorder.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
