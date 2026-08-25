@@ -12,10 +12,14 @@ from processor import (
     TranscriptionTimeout,
     atomic_json,
     audio_properties,
+    audio_refs_for_segments,
     choose_microphone,
+    choose_microphone_result,
+    concatenate_audio,
     extract_speech_audio,
     merge_vad_segments,
     normalized_agreement,
+    owned_vad_segments,
     parse_capture_time,
     vad_segments,
 )
@@ -29,6 +33,7 @@ class ProcessorTests(unittest.TestCase):
             discard_dir=root / "discarded",
             discard_grace_hours=72,
             settle_seconds=0,
+            lookahead_wait_seconds=75,
             zeris_url="http://zeris.invalid/events",
             zeris_token="test",
             qwen_timeout_seconds=0.02,
@@ -40,6 +45,9 @@ class ProcessorTests(unittest.TestCase):
 
     def test_microphone_medoid_rejects_outlier(self):
         self.assertEqual(choose_microphone(["明天交水费", "明天记得交水费", "今天去浇花"]), 0)
+
+    def test_microphone_result_falls_back_to_strongest_vad_channel(self):
+        self.assertEqual(choose_microphone_result([(1, "So."), (4, ""), (2, "")]), 1)
 
     def test_capture_time_uses_embedded_timezone(self):
         value = parse_capture_time(Path("2026-08-25_08-30-00_+0800.flac"))
@@ -90,6 +98,40 @@ class ProcessorTests(unittest.TestCase):
             ], check=True)
             extract_speech_audio(source, output, [(200, 500), (1500, 1800)])
             self.assertAlmostEqual(audio_properties(output)["duration_seconds"], 1.4, places=1)
+
+    def test_audio_concatenation_preserves_both_blocks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            first = Path(directory) / "first.wav"
+            second = Path(directory) / "second.wav"
+            output = Path(directory) / "joined.wav"
+            for path in (first, second):
+                subprocess.run([
+                    "ffmpeg", "-v", "error", "-f", "lavfi", "-i", "anullsrc=r=16000:cl=mono",
+                    "-t", "0.3", str(path),
+                ], check=True)
+            concatenate_audio([first, second], output)
+            self.assertAlmostEqual(audio_properties(output)["duration_seconds"], 0.6, places=1)
+
+    def test_boundary_ownership_keeps_crossing_utterance_only_upstream(self):
+        segments = [(1000, 2500), (59000, 62000), (70000, 72000)]
+        self.assertEqual(owned_vad_segments(segments, 60000), [(1000, 2500), (59000, 62000)])
+        continuation_view = [(0, 2000), (10000, 12000)]
+        self.assertEqual(owned_vad_segments(continuation_view, 60000, carried_until_ms=2000), [(10000, 12000)])
+
+    def test_cross_boundary_refs_include_offsets_and_hashes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = root / "2026-08-25_09-00-00_+0800.flac"
+            second = root / "2026-08-25_09-01-00_+0800.flac"
+            first.write_bytes(b"first")
+            second.write_bytes(b"second")
+            refs = audio_refs_for_segments(
+                [first, second], [60000, 60000], [(59000, 62000)], "nas://archive/evidence",
+            )
+            self.assertEqual(len(refs), 2)
+            self.assertEqual(refs[0]["offset_start_seconds"], 59.0)
+            self.assertEqual(refs[1]["offset_end_seconds"], 2.0)
+            self.assertRegex(refs[0]["sha256"], r"^[a-f0-9]{64}$")
 
     def test_empty_primary_with_one_active_channel_is_noise_false_positive(self):
         event = {

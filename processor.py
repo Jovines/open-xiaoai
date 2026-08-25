@@ -59,6 +59,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--zeris-token", default=os.environ.get("ZERIS_AUDIO_INGEST_TOKEN", ""))
     parser.add_argument("--poll-seconds", type=float, default=float(os.environ.get("PROCESSOR_POLL_SECONDS", "3")))
     parser.add_argument("--settle-seconds", type=float, default=float(os.environ.get("PROCESSOR_SETTLE_SECONDS", "5")))
+    parser.add_argument("--lookahead-wait-seconds", type=float, default=float(os.environ.get("PROCESSOR_LOOKAHEAD_WAIT_SECONDS", "75")))
     parser.add_argument("--discard-grace-hours", type=float, default=float(os.environ.get("PROCESSOR_DISCARD_GRACE_HOURS", "72")))
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--max-files", type=int, default=0)
@@ -83,6 +84,18 @@ def choose_microphone(transcripts: list[str]) -> int:
         for i, text in enumerate(transcripts)
     ]
     return max(range(3), key=lambda index: scores[index])
+
+
+def choose_microphone_result(results: list[tuple[int, str]]) -> int:
+    """Prefer cross-channel agreement, falling back to the strongest VAD result."""
+    texts = [text for _, text in results]
+    scores = [
+        sum(normalized_agreement(text, other) for j, other in enumerate(texts) if i != j)
+        for i, text in enumerate(texts)
+    ]
+    if max(scores, default=0.0) > 0:
+        return max(range(3), key=lambda index: scores[index])
+    return max(range(3), key=lambda index: (results[index][0], len(results[index][1])))
 
 
 def parse_capture_time(path: Path) -> dt.datetime:
@@ -124,6 +137,7 @@ def audio_properties(path: Path) -> dict:
 
 
 def extract_microphones(source: Path, directory: Path) -> list[Path]:
+    directory.mkdir(parents=True, exist_ok=True)
     outputs = []
     for channel in range(3):
         output = directory / f"mic-{channel}.wav"
@@ -133,6 +147,23 @@ def extract_microphones(source: Path, directory: Path) -> list[Path]:
         )
         outputs.append(output)
     return outputs
+
+
+def concatenate_audio(sources: list[Path], destination: Path) -> None:
+    if not sources:
+        raise ValueError("cannot concatenate an empty audio list")
+    if len(sources) == 1:
+        shutil.copyfile(sources[0], destination)
+        return
+    command = ["ffmpeg", "-v", "error", "-y"]
+    for source in sources:
+        command.extend(["-i", str(source)])
+    inputs = "".join(f"[{index}:a]" for index in range(len(sources)))
+    command.extend([
+        "-filter_complex", f"{inputs}concat=n={len(sources)}:v=0:a=1[out]",
+        "-map", "[out]", "-ar", "16000", "-ac", "1", str(destination),
+    ])
+    subprocess.run(command, check=True)
 
 
 def sensevoice(binary: Path, model: Path, vad: Path, audio: Path) -> tuple[int, str]:
@@ -196,6 +227,51 @@ def extract_speech_audio(source: Path, destination: Path, segments: list[tuple[i
         "-filter_complex", ";".join(filters), "-map", "[out]",
         "-ar", "16000", "-ac", "1", str(destination),
     ], check=True)
+
+
+def owned_vad_segments(
+    segments: list[tuple[int, int]],
+    boundary_ms: int,
+    carried_until_ms: int = 0,
+) -> list[tuple[int, int]]:
+    """Assign utterances by start time and suppress a continuation owned upstream."""
+    owned = []
+    for start, end in segments:
+        if start >= boundary_ms:
+            continue
+        if carried_until_ms > 0 and start <= 500 and end <= carried_until_ms + 1000:
+            continue
+        owned.append((start, end))
+    return owned
+
+
+def audio_refs_for_segments(
+    sources: list[Path],
+    durations_ms: list[int],
+    segments: list[tuple[int, int]],
+    nas_uri_root: str,
+) -> list[dict]:
+    """Describe every immutable source block touched by the owned utterances."""
+    if len(sources) != len(durations_ms):
+        raise ValueError("source and duration counts differ")
+    first = min(start for start, _ in segments)
+    last = max(end for _, end in segments)
+    refs = []
+    cursor = 0
+    for source, duration in zip(sources, durations_ms):
+        overlap_start = max(first, cursor)
+        overlap_end = min(last, cursor + duration)
+        if overlap_end > overlap_start:
+            captured = parse_capture_time(source)
+            relative = Path(captured.strftime("%Y/%m/%d")) / source.name
+            refs.append({
+                "uri": f"{nas_uri_root.rstrip('/')}/{relative.as_posix()}",
+                "sha256": sha256_file(source),
+                "offset_start_seconds": round((overlap_start - cursor) / 1000, 3),
+                "offset_end_seconds": round((overlap_end - cursor) / 1000, 3),
+            })
+        cursor += duration
+    return refs
 
 
 class EvidenceProcessor:
@@ -284,6 +360,11 @@ class EvidenceProcessor:
             path for path in self.args.input_dir.rglob("*")
             if path.is_file() and path.suffix.lower() in SUPPORTED_AUDIO and not path.name.startswith(".") and path.stat().st_mtime <= cutoff
         )
+
+    @staticmethod
+    def is_contiguous(left: Path, right: Path, tolerance_seconds: float = 3.0) -> bool:
+        delta = (parse_capture_time(right) - parse_capture_time(left)).total_seconds()
+        return 0 < delta <= 60 + tolerance_seconds
 
     def relative_destination(self, source: Path) -> Path:
         captured = parse_capture_time(source)
@@ -421,37 +502,85 @@ class EvidenceProcessor:
         except (urllib.error.URLError, TimeoutError) as error:
             raise EventPostError(f"Zeris 上报失败：{error}", retryable=True) from error
 
-    def process_file(self, source: Path) -> str:
+    def carry_path(self, source: Path) -> Path:
+        return source.with_suffix(source.suffix + ".carry.json")
+
+    def read_carry(self, source: Path) -> dict:
+        path = self.carry_path(source)
+        if not path.is_file():
+            return {}
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+            return value if isinstance(value, dict) else {}
+        except (OSError, json.JSONDecodeError):
+            logging.exception("无法读取跨分段延续状态，将保守地重新处理边界：%s", path)
+            return {}
+
+    def consume_carry(self, source: Path) -> None:
+        path = self.carry_path(source)
+        if path.is_file():
+            path.unlink()
+
+    def process_file(self, source: Path, lookahead: Path | None = None) -> str:
         with tempfile.TemporaryDirectory(prefix="open-xiaoai-process-") as temporary:
-            microphones = extract_microphones(source, Path(temporary))
-            sense_results = [sensevoice(self.args.sense_binary, self.args.sense_model, self.args.vad_model, audio) for audio in microphones]
-            if not any(segments > 0 and text for segments, text in sense_results):
+            temporary_dir = Path(temporary)
+            sources = [source] + ([lookahead] if lookahead is not None else [])
+            properties = [audio_properties(item) for item in sources]
+            durations_ms = [round(item["duration_seconds"] * 1000) for item in properties]
+            boundary_ms = durations_ms[0]
+            source_microphones = [extract_microphones(item, temporary_dir / f"source-{index}") for index, item in enumerate(sources)]
+            microphones = []
+            for channel in range(3):
+                output = temporary_dir / f"window-mic-{channel}.wav"
+                concatenate_audio([items[channel] for items in source_microphones], output)
+                microphones.append(output)
+
+            window_results = [sensevoice(self.args.sense_binary, self.args.sense_model, self.args.vad_model, audio) for audio in microphones]
+            channel = choose_microphone_result(window_results)
+            speech_segments = vad_segments(self.args.vad_binary, self.args.vad_model, microphones[channel])
+            overlapping = [(start, end) for start, end in speech_segments if start < boundary_ms and end > 0]
+            carry = self.read_carry(source)
+            if not overlapping:
+                if carry:
+                    relative = self.relative_destination(source)
+                    evidence_audio = self.args.evidence_dir / relative
+                    evidence_audio.parent.mkdir(parents=True, exist_ok=True)
+                    if evidence_audio.exists():
+                        raise RuntimeError(f"证据文件已存在，拒绝覆盖：{evidence_audio}")
+                    source.replace(evidence_audio)
+                    self.consume_carry(source)
+                    logging.warning("边界延续状态存在但当前 VAD 未复现，已保守保留原音：%s", evidence_audio)
+                    return "continuation"
                 self.quarantine_audio(
                     source,
                     classification="no_speech",
                     classifier={"model": "SenseVoiceSmall-Q8", "vad": "FSMN-VAD", "channels_checked": 3},
                 )
+                self.consume_carry(source)
                 return "discarded"
 
+            owned_segments = owned_vad_segments(speech_segments, boundary_ms, int(carry.get("until_ms", 0) or 0))
+            if not owned_segments:
+                relative = self.relative_destination(source)
+                evidence_audio = self.args.evidence_dir / relative
+                evidence_audio.parent.mkdir(parents=True, exist_ok=True)
+                if evidence_audio.exists():
+                    raise RuntimeError(f"证据文件已存在，拒绝覆盖：{evidence_audio}")
+                source.replace(evidence_audio)
+                self.consume_carry(source)
+                logging.info("本段只有上一话语的跨界尾部，原音已保留且不重复转写：%s", evidence_audio)
+                return "continuation"
+
+            speech_microphones = []
+            for mic_channel, microphone in enumerate(microphones):
+                speech_output = temporary_dir / f"speech-mic-{mic_channel}.wav"
+                extract_speech_audio(microphone, speech_output, owned_segments)
+                speech_microphones.append(speech_output)
+            sense_results = [sensevoice(self.args.sense_binary, self.args.sense_model, self.args.vad_model, audio) for audio in speech_microphones]
             texts = [text for _, text in sense_results]
-            channel = choose_microphone(texts)
-            speech_segments = vad_segments(self.args.vad_binary, self.args.vad_model, microphones[channel])
-            if not speech_segments:
-                self.quarantine_audio(
-                    source,
-                    classification="no_reliable_speech",
-                    classifier={
-                        "model": "SenseVoiceSmall-Q8",
-                        "vad": "FSMN-VAD",
-                        "reason": "selected_channel_has_no_vad_intervals",
-                        "selected_microphone": channel,
-                    },
-                )
-                return "discarded"
-            speech_audio = Path(temporary) / "selected-speech-only.wav"
-            extract_speech_audio(microphones[channel], speech_audio, speech_segments)
+            channel = choose_microphone_result(sense_results)
             try:
-                primary = self.qwen_transcribe(speech_audio)
+                primary = self.qwen_transcribe(speech_microphones[channel])
             except TranscriptionTimeout as error:
                 self.preserve_processing_failure(
                     source,
@@ -461,11 +590,12 @@ class EvidenceProcessor:
                         "device": "cpu",
                         "timeout_seconds": self.args.qwen_timeout_seconds,
                         "selected_microphone": channel,
-                        "speech_segments_ms": speech_segments,
+                        "speech_segments_ms": owned_segments,
                         "sensevoice_transcripts": texts,
                         "error": str(error),
                     },
                 )
+                self.consume_carry(source)
                 return "processing_failed"
             active_channels = sum(bool(text.strip()) for text in texts)
             if not primary and active_channels <= 1:
@@ -481,12 +611,25 @@ class EvidenceProcessor:
                         "channels_checked": 3,
                     },
                 )
+                self.consume_carry(source)
                 return "discarded"
+
             speakers, diarization_status = self.diarize(microphones[channel])
-            audio = audio_properties(source)
-            duration = audio["duration_seconds"]
+            event_start_ms = min(start for start, _ in owned_segments)
+            event_end_ms = max(end for _, end in owned_segments)
+            filtered_speakers = []
+            for speaker in speakers:
+                start_ms = round(speaker["start_seconds"] * 1000)
+                end_ms = round(speaker["end_seconds"] * 1000)
+                if any(start_ms < segment_end and end_ms > segment_start for segment_start, segment_end in owned_segments):
+                    filtered_speakers.append({
+                        **speaker,
+                        "start_seconds": round(max(0, start_ms - event_start_ms) / 1000, 3),
+                        "end_seconds": round(max(0, end_ms - event_start_ms) / 1000, 3),
+                    })
             started = parse_capture_time(source)
-            ended = started + dt.timedelta(seconds=duration)
+            occurred = started + dt.timedelta(milliseconds=event_start_ms)
+            ended = started + dt.timedelta(milliseconds=event_end_ms)
             digest = sha256_file(source)
             relative = self.relative_destination(source)
             evidence_audio = self.args.evidence_dir / relative
@@ -495,23 +638,37 @@ class EvidenceProcessor:
                 raise RuntimeError(f"证据文件已存在，拒绝覆盖：{evidence_audio}")
             source.replace(evidence_audio)
 
+            referenced_sources = sources if event_end_ms > boundary_ms and lookahead is not None else [source]
+            referenced_durations = durations_ms[:len(referenced_sources)]
+            refs = audio_refs_for_segments(
+                [evidence_audio] + ([lookahead] if len(referenced_sources) > 1 else []),
+                referenced_durations,
+                owned_segments,
+                self.args.nas_uri_root,
+            )
+            identity = hashlib.sha256(json.dumps({
+                "sources": [item["sha256"] for item in refs],
+                "segments": owned_segments,
+            }, sort_keys=True).encode("utf-8")).hexdigest()
+
             comparisons = [normalized_agreement(primary, text) for text in texts if text]
             score = sum(comparisons) / len(comparisons) if comparisons else 0.0
             agreement = "high" if score >= 0.88 else "medium" if score >= 0.65 else "low"
             event = {
-                "event_id": f"audio-{digest[:24]}",
-                "occurred_at": started.isoformat(),
+                "event_id": f"audio-{identity[:24]}",
+                "occurred_at": occurred.isoformat(),
                 "ended_at": ended.isoformat(),
                 "source": "xiaoai-oh2p-3mic",
-                "audio_ref": f"{self.args.nas_uri_root.rstrip('/')}/{relative.as_posix()}",
+                "audio_ref": refs[0]["uri"],
                 "audio_sha256": digest,
+                "audio_refs": refs,
                 "transcript": primary,
                 "language": "zh",
                 "alternatives": [
                     {"model": "SenseVoiceSmall", "version": "Q8-GGUF", "text": text}
                     for text in texts if text
                 ],
-                "speakers": speakers,
+                "speakers": filtered_speakers,
                 "reliability": {
                     "agreement": agreement,
                     "score": round(score, 4),
@@ -527,10 +684,16 @@ class EvidenceProcessor:
                         "device": "cpu",
                         "selected_microphone": channel,
                         "input": "fsmn_vad_speech_regions_concatenated",
-                        "speech_segments_ms": speech_segments,
+                        "speech_segments_ms": owned_segments,
                     },
                     "cross_check": {"model": "SenseVoiceSmall-Q8", "vad": "FSMN-VAD", "all_microphone_transcripts": texts},
-                    "audio": audio,
+                    "audio": {
+                        "storage_blocks": properties,
+                        "fixed_block_seconds": properties[0]["duration_seconds"],
+                        "lookahead_used": lookahead is not None,
+                        "boundary_ownership": "utterance_start",
+                        "carried_from_previous_until_ms": int(carry.get("until_ms", 0) or 0),
+                    },
                     "speaker_diarization": {
                         "status": diarization_status,
                         "engine": "sherpa-onnx/pyannote-segmentation-3.0/3D-Speaker-zh",
@@ -541,6 +704,15 @@ class EvidenceProcessor:
             }
             pending = evidence_audio.with_suffix(evidence_audio.suffix + ".event.pending.json")
             atomic_json(pending, event)
+            continuation_until = max((end - boundary_ms for _, end in owned_segments if end > boundary_ms), default=0)
+            if lookahead is not None and continuation_until > 0:
+                atomic_json(self.carry_path(lookahead), {
+                    "schema_version": 1,
+                    "owner_event_id": event["event_id"],
+                    "until_ms": continuation_until,
+                    "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                })
+            self.consume_carry(source)
             try:
                 self.post_event(event)
             except EventPostError as error:
@@ -552,7 +724,7 @@ class EvidenceProcessor:
             if self.args.zeris_url:
                 pending.replace(evidence_audio.with_suffix(evidence_audio.suffix + ".event.json"))
                 self.finish_pending(pending)
-            logging.info("已保留语音证据：%s（模型一致度 %.3f）", evidence_audio, score)
+            logging.info("已保留跨边界语音证据：%s（%d 个 VAD 区间，模型一致度 %.3f）", evidence_audio, len(owned_segments), score)
             return "evidence"
 
     def retry_pending_events(self) -> int:
@@ -622,9 +794,13 @@ class EvidenceProcessor:
                 if removed:
                     logging.info("已删除 %d 个过期的无语音隔离段", removed)
                 self.retry_pending_events()
-                for source in self.pending_files():
+                sources = self.pending_files()
+                for index, source in enumerate(sources):
+                    lookahead = sources[index + 1] if index + 1 < len(sources) and self.is_contiguous(source, sources[index + 1]) else None
+                    if lookahead is None and time.time() - source.stat().st_mtime < self.args.lookahead_wait_seconds:
+                        continue
                     try:
-                        self.process_file(source)
+                        self.process_file(source, lookahead)
                         processed += 1
                     except Exception:
                         logging.exception("单个录音处理失败，已保留并继续后续文件：%s", source)
