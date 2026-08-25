@@ -7,7 +7,7 @@
 1. `recorder.py` 只建立一条长期 SSH/`arecord` 音频流，以准确的样本数切成 60 秒临时段；切段时不会重新连接音箱。
 2. 原音以 `48 kHz / 3 通道 / 24-bit FLAC` 无损保存。硬件提供四路 PCM，其中第四路恒为零，因此不归档。
 3. `processor.py` 分别检查三支麦克风。FSMN-VAD/SenseVoice 判断没有语音的段先隔离 72 小时，核对哈希后才删除；分类清单永久留下。若只有一路被噪声误触发、而 Qwen 主转写为空，也按 `no_reliable_speech` 进入同样的可恢复隔离。
-4. 有语音的整段原音进入 `evidence/`。Qwen3-ASR-1.7B 在 CPU 上生成主转写，SenseVoiceSmall 从三路麦克风独立生成候选，字符一致度只用于提示风险。
+4. 有语音的整段原音进入 `evidence/`。Qwen3-ASR-1.7B 在 CPU 上生成主转写，SenseVoiceSmall 从三路麦克风独立生成候选，字符一致度只用于提示风险。单段 Qwen 默认最多运行 45 秒，避免噪声触发长幻觉并卡住队列；超时原音永久保留为 `.processing_failed.json`，不向 Agent 发布错误文本。
 5. sherpa-onnx 用 Pyannote segmentation + 中文 3D-Speaker 在 CPU 上给出仅在当前录音内有效的匿名说话人片段；它不会猜姓名、性别，也不会把不同录音的 `speaker-00` 当成同一个人。
 6. 事件连同模型、运行设备、候选文本、原音 SHA-256 和 NAS 地址发给 Zeris。临时上报失败时保留 `.event.pending.json`，以 15 秒至 15 分钟指数退避重试；每个事件独立处理，一个坏事件不会阻塞之后的 VAD、转写或上报。永久拒绝的事件标为 `.event.rejected.json`，原音保留供人工复核。
 
