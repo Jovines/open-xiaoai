@@ -9,6 +9,7 @@ from unittest import mock
 from processor import (
     EventPostError,
     EvidenceProcessor,
+    TranscriptionTimeout,
     atomic_json,
     audio_properties,
     choose_microphone,
@@ -27,6 +28,8 @@ class ProcessorTests(unittest.TestCase):
             settle_seconds=0,
             zeris_url="http://zeris.invalid/events",
             zeris_token="test",
+            qwen_timeout_seconds=0.02,
+            qwen_max_new_tokens=384,
         ))
 
     def test_agreement_ignores_spacing_and_punctuation(self):
@@ -121,6 +124,29 @@ class ProcessorTests(unittest.TestCase):
             with self.assertRaises(EventPostError) as caught:
                 processor.post_event({"transcript": "  "})
             self.assertFalse(caught.exception.retryable)
+
+    def test_qwen_transcription_has_a_hard_timeout(self):
+        with tempfile.TemporaryDirectory() as directory:
+            processor = self.make_processor(directory)
+            processor.qwen = mock.Mock()
+            processor.qwen.transcribe.side_effect = lambda *args, **kwargs: __import__("time").sleep(1)
+            with self.assertRaises(TranscriptionTimeout):
+                processor.qwen_transcribe(Path(directory) / "audio.wav")
+
+    def test_processing_failure_is_preserved_without_expiry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            processor = self.make_processor(directory)
+            source = Path(directory) / "2026-08-25_09-10-13_+0800.flac"
+            source.write_bytes(b"possible-speech")
+            evidence = processor.preserve_processing_failure(
+                source,
+                reason="primary_asr_timeout",
+                details={"timeout_seconds": 45},
+            )
+            failure = evidence.with_suffix(evidence.suffix + ".processing_failed.json")
+            self.assertTrue(evidence.is_file())
+            self.assertTrue(failure.is_file())
+            self.assertNotIn("delete_after", failure.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

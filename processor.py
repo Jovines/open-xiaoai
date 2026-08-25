@@ -12,6 +12,7 @@ import logging
 import os
 from pathlib import Path
 import re
+import signal
 import shutil
 import subprocess
 import tempfile
@@ -32,6 +33,10 @@ class EventPostError(RuntimeError):
         self.retryable = retryable
 
 
+class TranscriptionTimeout(RuntimeError):
+    """The primary ASR exceeded the per-recording CPU time budget."""
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="筛掉无语音录音，并生成可回听、可审计的中文转写证据")
     parser.add_argument("--input-dir", type=Path, default=Path(os.environ.get("PROCESSOR_INPUT_DIR", "/mnt/dx4600/家庭管家/录音/inbox")))
@@ -43,6 +48,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--sense-model", type=Path, default=Path(os.environ.get("SENSEVOICE_MODEL", str(Path.home() / "models/sensevoice-small/sensevoice-small-q8.gguf"))))
     parser.add_argument("--vad-model", type=Path, default=Path(os.environ.get("SENSEVOICE_VAD_MODEL", str(Path.home() / "models/sensevoice-small/fsmn-vad.gguf"))))
     parser.add_argument("--qwen-model", default=os.environ.get("QWEN_ASR_MODEL", "Qwen/Qwen3-ASR-1.7B"))
+    parser.add_argument("--qwen-timeout-seconds", type=float, default=float(os.environ.get("QWEN_ASR_TIMEOUT_SECONDS", "45")))
+    parser.add_argument("--qwen-max-new-tokens", type=int, default=int(os.environ.get("QWEN_ASR_MAX_NEW_TOKENS", "384")))
     parser.add_argument("--diarization-python", type=Path, default=Path(os.environ.get("DIARIZATION_PYTHON", str(Path.home() / ".venvs/sherpa-onnx/bin/python"))))
     parser.add_argument("--diarization-script", type=Path, default=Path(os.environ.get("DIARIZATION_SCRIPT", str(Path(__file__).with_name("diarize.py")))))
     parser.add_argument("--diarization-segmentation", type=Path, default=Path(os.environ.get("DIARIZATION_SEGMENTATION_MODEL", str(Path.home() / "models/speaker-diarization/sherpa-onnx-pyannote-segmentation-3-0/model.onnx"))))
@@ -172,13 +179,24 @@ class EvidenceProcessor:
             device_map="cpu",
             dtype="float32",
             max_inference_batch_size=1,
-            max_new_tokens=512,
+            max_new_tokens=self.args.qwen_max_new_tokens,
         )
 
     def qwen_transcribe(self, audio: Path) -> str:
         self.load_qwen()
-        result = self.qwen.transcribe(str(audio), language="Chinese")
-        return result[0].text.strip()
+        timeout = max(0.01, self.args.qwen_timeout_seconds)
+
+        def timed_out(signum, frame):
+            raise TranscriptionTimeout(f"Qwen 主转写超过 {timeout:g} 秒")
+
+        previous_handler = signal.signal(signal.SIGALRM, timed_out)
+        signal.setitimer(signal.ITIMER_REAL, timeout)
+        try:
+            result = self.qwen.transcribe(str(audio), language="Chinese")
+            return result[0].text.strip()
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, previous_handler)
 
     def diarize(self, audio: Path) -> tuple[list[dict], str]:
         required = (
@@ -258,6 +276,29 @@ class EvidenceProcessor:
         atomic_json(manifest, record)
         logging.info("%s，已隔离 %s 小时后再删除：%s", classification, self.args.discard_grace_hours, quarantine)
         return quarantine
+
+    def preserve_processing_failure(self, source: Path, *, reason: str, details: dict) -> Path:
+        """Keep possible speech permanently without publishing an unreliable event."""
+        digest = sha256_file(source)
+        relative = self.relative_destination(source)
+        evidence_audio = self.args.evidence_dir / relative
+        failure = evidence_audio.with_suffix(evidence_audio.suffix + ".processing_failed.json")
+        evidence_audio.parent.mkdir(parents=True, exist_ok=True)
+        if evidence_audio.exists() or failure.exists():
+            raise RuntimeError(f"失败证据目标已存在，拒绝覆盖：{evidence_audio}")
+        source.replace(evidence_audio)
+        atomic_json(failure, {
+            "schema_version": 1,
+            "classification": "processing_failed",
+            "reason": reason,
+            "source_sha256": digest,
+            "source_bytes": evidence_audio.stat().st_size,
+            "preserved_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "audio_file": evidence_audio.name,
+            "details": details,
+        })
+        logging.error("主转写失败，原音已永久保留且不向 Agent 发布：%s（%s）", evidence_audio, reason)
+        return evidence_audio
 
     @staticmethod
     def is_single_channel_false_positive(event: dict) -> bool:
@@ -342,7 +383,22 @@ class EvidenceProcessor:
 
             texts = [text for _, text in sense_results]
             channel = choose_microphone(texts)
-            primary = self.qwen_transcribe(microphones[channel])
+            try:
+                primary = self.qwen_transcribe(microphones[channel])
+            except TranscriptionTimeout as error:
+                self.preserve_processing_failure(
+                    source,
+                    reason="primary_asr_timeout",
+                    details={
+                        "model": "Qwen3-ASR-1.7B",
+                        "device": "cpu",
+                        "timeout_seconds": self.args.qwen_timeout_seconds,
+                        "selected_microphone": channel,
+                        "sensevoice_transcripts": texts,
+                        "error": str(error),
+                    },
+                )
+                return "processing_failed"
             active_channels = sum(bool(text.strip()) for text in texts)
             if not primary and active_channels <= 1:
                 self.quarantine_audio(
