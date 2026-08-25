@@ -10,6 +10,7 @@ from processor import (
     EventPostError,
     EvidenceProcessor,
     TranscriptionTimeout,
+    acoustic_scene_without_reference,
     atomic_json,
     audio_properties,
     audio_refs_for_segments,
@@ -42,6 +43,13 @@ class ProcessorTests(unittest.TestCase):
 
     def test_agreement_ignores_spacing_and_punctuation(self):
         self.assertEqual(normalized_agreement("明天，交水费。", "明天交水费"), 1.0)
+
+    def test_missing_playback_reference_never_claims_a_speaker_origin(self):
+        scene = acoustic_scene_without_reference()
+        self.assertEqual(scene["scene_type"], "unknown")
+        self.assertTrue(scene["needs_review"])
+        self.assertFalse(scene["playback_reference"]["available"])
+        self.assertEqual(scene["turns"], [])
 
     def test_microphone_medoid_rejects_outlier(self):
         self.assertEqual(choose_microphone(["明天交水费", "明天记得交水费", "今天去浇花"]), 0)

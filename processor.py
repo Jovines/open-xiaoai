@@ -75,6 +75,22 @@ def normalized_agreement(left: str, right: str) -> float:
     return difflib.SequenceMatcher(None, a, b).ratio()
 
 
+def acoustic_scene_without_reference() -> dict:
+    """State explicitly that speaker-origin attribution has not been performed."""
+    return {
+        "scene_type": "unknown",
+        "interaction_id": None,
+        "confidence": None,
+        "needs_review": True,
+        "playback_reference": {
+            "available": False,
+            "coverage": None,
+            "source": None,
+        },
+        "turns": [],
+    }
+
+
 def choose_microphone(transcripts: list[str]) -> int:
     """Choose the transcript most similar to the other active microphones."""
     if len(transcripts) != 3:
@@ -669,6 +685,7 @@ class EvidenceProcessor:
                     for text in texts if text
                 ],
                 "speakers": filtered_speakers,
+                "acoustic_scene": acoustic_scene_without_reference(),
                 "reliability": {
                     "agreement": agreement,
                     "score": round(score, 4),
@@ -693,6 +710,7 @@ class EvidenceProcessor:
                         "lookahead_used": lookahead is not None,
                         "boundary_ownership": "utterance_start",
                         "carried_from_previous_until_ms": int(carry.get("until_ms", 0) or 0),
+                        "playback_reference_archived": False,
                     },
                     "speaker_diarization": {
                         "status": diarization_status,
