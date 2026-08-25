@@ -8,7 +8,7 @@
 2. 原音以 `48 kHz / 3 通道 / 24-bit FLAC` 无损保存。硬件提供四路 PCM，其中第四路恒为零，因此不归档。A113 低位样本使用 `×96` 映射，在受控外放中相对旧 `×256` 将削波减少约 560 倍，同时保留约 8.5 dB 头部空间。
 3. `processor.py` 分别检查三支麦克风。FSMN-VAD/SenseVoice 判断没有语音的段先隔离 72 小时，核对哈希后才删除；分类清单永久留下。若只有一路被噪声误触发、而 Qwen 主转写为空，也按 `no_reliable_speech` 进入同样的可恢复隔离。
 4. 处理器会等待下一分钟落盘，再把“当前块 + 下一块”作为连续窗口运行 FSMN-VAD。话语按开始时间唯一归属：若从当前块末尾说到下一块开头，上一事件取得完整尾巴，持久化 carry 状态让下一块不重复转写；采集停止时，最后一块等待 75 秒后自动降级为单块处理。
-5. 有语音的整段原音进入 `evidence/`。只把毫秒级语音区间（两端各保留 200 ms）拼接给 CPU 上的 Qwen3-ASR-1.7B；原始 60 秒三通道音频完全不裁剪。跨界事件携带所有相关 FLAC 的 NAS URI、SHA-256 和块内偏移，能够重建并校验原话。SenseVoiceSmall 从三路麦克风独立生成候选；只有 Qwen 与三路候选归一化后完全一致才算高一致度，任何单字冲突都强制 `needs_review`。单段 Qwen 默认最多运行 45 秒，避免噪声触发长幻觉并卡住队列；超时原音永久保留为 `.processing_failed.json`，不向 Agent 发布错误文本。
+5. 有语音的整段原音进入 `evidence/`。只把毫秒级语音区间（两端各保留 200 ms）拼接给 CPU 上的 Qwen3-ASR-1.7B；原始 60 秒三通道音频完全不裁剪。跨界事件携带所有相关 FLAC 的 NAS URI、SHA-256 和块内偏移，能够重建并校验原话。SenseVoiceSmall 从三路麦克风独立生成候选；只有 Qwen 与三路候选归一化后完全一致才算高一致度。若三路 SenseVoice 完全一致却与 Qwen 冲突，才临时启动 CPU 上的 FireRedASR2-AED 仲裁；它确认三麦共识时可修正展示文本，但事件仍保留全部候选并强制 `needs_review`。FireRed 超时、缺失或失败只会回退 Qwen，不会阻断归档。单段 Qwen 默认最多运行 45 秒，避免噪声触发长幻觉并卡住队列；超时原音永久保留为 `.processing_failed.json`，不向 Agent 发布错误文本。
 6. sherpa-onnx 用 Pyannote segmentation + 中文 3D-Speaker 在 CPU 上给出仅在当前录音内有效的匿名说话人片段；它不会猜姓名、性别，也不会把不同录音的 `speaker-00` 当成同一个人。
 7. 事件连同模型、运行设备、候选文本、原音 SHA-256 和 NAS 地址发给 Zeris。临时上报失败时保留 `.event.pending.json`，以 15 秒至 15 分钟指数退避重试；每个事件独立处理，一个坏事件不会阻塞之后的 VAD、转写或上报。永久拒绝的事件标为 `.event.rejected.json`，原音保留供人工复核。
 
@@ -24,6 +24,7 @@ OH2P 声卡拓扑、原厂进程边界、播放 fan-out 协议、内核兼容踩
 
 - 10 秒中文家庭录音：Qwen3-ASR-1.7B 纯 CPU 推理约 6.3 秒，模型常驻约 13 GB RAM；GPU 不参与。
 - SenseVoiceSmall-Q8 同一录音约 0.5 秒、约 300 MB RAM，适合 VAD 和异构复核。
+- FireRedASR2-AED 对 6.67 秒 VAD 单声道样本冷启动约 5.9 秒、推理约 4.9 秒、峰值约 9.6 GB RAM；只在强冲突时作为短命子进程运行。
 - 10 秒三通道无损 FLAC 约 3.3 MiB，即未经筛选约 28–30 GiB/天。NAS 临时承接全部原音，处理成功后只长期保留含语音的证据段。
 
 数字是当前 i7-12700 主机上的一次实测，不是性能承诺。N5105 小主机内存不足以舒适常驻 1.7B float32 模型，因此转写服务部署在当前主机，Zeris 仍运行在小主机。
@@ -44,6 +45,7 @@ sudo apt install ffmpeg openssh-client sshpass
 - `~/models/huggingface`：Qwen3-ASR-1.7B
 - `~/.local/opt/sensevoice/llama-funasr-sensevoice`
 - `~/models/sensevoice-small/{sensevoice-small-q8.gguf,fsmn-vad.gguf}`
+- `~/.local/opt/fireredasr2s`、`~/.local/opt/fireredasr2-deps-py312` 与 `~/models/fireredasr2-aed`：按需 CPU 仲裁
 - `~/.venvs/sherpa-onnx` 与 `~/models/speaker-diarization/`：匿名说话人分离
 
 ## 短时测试
