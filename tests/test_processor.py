@@ -11,6 +11,7 @@ from processor import (
     EvidenceProcessor,
     TranscriptionTimeout,
     acoustic_scene_without_reference,
+    acoustic_scene_with_playback,
     atomic_json,
     audio_properties,
     audio_refs_for_segments,
@@ -22,6 +23,7 @@ from processor import (
     normalized_agreement,
     owned_vad_segments,
     parse_capture_time,
+    playback_matches_for_window,
     vad_segments,
 )
 
@@ -50,6 +52,47 @@ class ProcessorTests(unittest.TestCase):
         self.assertTrue(scene["needs_review"])
         self.assertFalse(scene["playback_reference"]["available"])
         self.assertEqual(scene["turns"], [])
+
+    def test_playback_manifest_overlap_becomes_bounded_nas_reference(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            day = root / "2026/08/25"
+            day.mkdir(parents=True)
+            audio = day / "playback.flac"
+            audio.write_bytes(b"reference")
+            atomic_json(day / "playback.json", {
+                "kind": "oh2p_playback_reference",
+                "occurred_at": "2026-08-25T02:00:05+00:00",
+                "ended_at": "2026-08-25T02:00:10+00:00",
+                "audio_file": audio.name,
+                "audio_sha256": "b" * 64,
+            })
+            matches = playback_matches_for_window(
+                dt.datetime.fromisoformat("2026-08-25T10:00:00+08:00"),
+                dt.datetime.fromisoformat("2026-08-25T10:00:08+08:00"),
+                root,
+                "nas://archive/playback",
+            )
+            self.assertEqual(len(matches), 1)
+            self.assertEqual(matches[0]["offset_start_seconds"], 0.0)
+            self.assertEqual(matches[0]["offset_end_seconds"], 3.0)
+            self.assertEqual(matches[0]["event_start_seconds"], 5.0)
+
+    def test_scene_keeps_playback_and_overlapping_near_end_uncertainty_separate(self):
+        scene = acoustic_scene_with_playback(
+            "a" * 64,
+            8.0,
+            [(0.0, 2.0), (5.0, 7.0)],
+            [{"event_start_seconds": 4.0, "event_end_seconds": 8.0}],
+        )
+        self.assertEqual(scene["scene_type"], "xiaoai_dialogue")
+        self.assertTrue(scene["playback_reference"]["available"])
+        origins = [item["origin"] for item in scene["turns"]]
+        self.assertIn("human", origins)
+        self.assertIn("xiaoai_output", origins)
+        self.assertIn("unknown", origins)
+        self.assertNotIn("overlap", origins)
+        self.assertTrue(scene["needs_review"])
 
     def test_microphone_medoid_rejects_outlier(self):
         self.assertEqual(choose_microphone(["明天交水费", "明天记得交水费", "今天去浇花"]), 0)

@@ -44,6 +44,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--discard-dir", type=Path, default=Path(os.environ.get("PROCESSOR_DISCARD_DIR", "/mnt/dx4600/家庭管家/录音/discarded")))
     parser.add_argument("--required-mount", type=Path, default=Path(os.environ.get("PROCESSOR_REQUIRED_MOUNT", "/mnt/dx4600")))
     parser.add_argument("--nas-uri-root", default=os.environ.get("PROCESSOR_NAS_URI_ROOT", "nas://dx4600/家庭管家/录音/evidence"))
+    parser.add_argument("--playback-dir", type=Path, default=Path(os.environ.get("PROCESSOR_PLAYBACK_DIR", "/mnt/dx4600/家庭管家/录音/playback")))
+    parser.add_argument("--playback-nas-uri-root", default=os.environ.get("PROCESSOR_PLAYBACK_NAS_URI_ROOT", "nas://dx4600/家庭管家/录音/playback"))
     parser.add_argument("--sense-binary", type=Path, default=Path(os.environ.get("SENSEVOICE_BINARY", str(Path.home() / ".local/opt/sensevoice/llama-funasr-sensevoice"))))
     parser.add_argument("--vad-binary", type=Path, default=Path(os.environ.get("FSMN_VAD_BINARY", str(Path.home() / ".local/opt/sensevoice/llama-funasr-vad"))))
     parser.add_argument("--sense-model", type=Path, default=Path(os.environ.get("SENSEVOICE_MODEL", str(Path.home() / "models/sensevoice-small/sensevoice-small-q8.gguf"))))
@@ -88,6 +90,107 @@ def acoustic_scene_without_reference() -> dict:
             "source": None,
         },
         "turns": [],
+    }
+
+
+def playback_matches_for_window(
+    occurred: dt.datetime,
+    ended: dt.datetime,
+    playback_dir: Path,
+    nas_uri_root: str,
+) -> list[dict]:
+    """Find archived playback PCM that overlaps an absolute microphone event."""
+    if not playback_dir.is_dir():
+        return []
+    local_start = occurred.astimezone()
+    local_end = ended.astimezone()
+    dates = {local_start.date(), local_end.date()}
+    matches = []
+    for date in dates:
+        directory = playback_dir / date.strftime("%Y/%m/%d")
+        for manifest_path in sorted(directory.glob("*.json")) if directory.is_dir() else []:
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                if manifest.get("kind") != "oh2p_playback_reference":
+                    continue
+                reference_start = dt.datetime.fromisoformat(manifest["occurred_at"])
+                reference_end = dt.datetime.fromisoformat(manifest["ended_at"])
+                audio = manifest_path.with_name(manifest["audio_file"])
+                sha256 = str(manifest["audio_sha256"])
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError, OSError):
+                continue
+            if not audio.is_file() or not re.fullmatch(r"[a-f0-9]{64}", sha256):
+                continue
+            overlap_start = max(occurred, reference_start)
+            overlap_end = min(ended, reference_end)
+            if overlap_end <= overlap_start:
+                continue
+            relative = audio.relative_to(playback_dir)
+            matches.append({
+                "uri": f"{nas_uri_root.rstrip('/')}/{relative.as_posix()}",
+                "sha256": sha256,
+                "offset_start_seconds": round((overlap_start - reference_start).total_seconds(), 3),
+                "offset_end_seconds": round((overlap_end - reference_start).total_seconds(), 3),
+                "event_start_seconds": round((overlap_start - occurred).total_seconds(), 3),
+                "event_end_seconds": round((overlap_end - occurred).total_seconds(), 3),
+            })
+    return sorted(matches, key=lambda item: (item["event_start_seconds"], item["uri"]))[:4]
+
+
+def acoustic_scene_with_playback(
+    identity: str,
+    event_duration_seconds: float,
+    speech_segments_seconds: list[tuple[float, float]],
+    playback_matches: list[dict],
+) -> dict:
+    if not playback_matches:
+        return acoustic_scene_without_reference()
+    playback_intervals = [(item["event_start_seconds"], item["event_end_seconds"]) for item in playback_matches]
+    playback_seconds = sum(max(0.0, end - start) for start, end in playback_intervals)
+    turns = [{
+        "origin": "xiaoai_output",
+        "speaker_id": None,
+        "start_seconds": start,
+        "end_seconds": end,
+        "confidence": 1.0,
+        "transcript": None,
+        "evidence": ["archived_playback_reference"],
+    } for start, end in playback_intervals]
+    human_turns = []
+    unknown_turns = []
+    for start, end in speech_segments_seconds:
+        duration = max(0.001, end - start)
+        overlap = sum(max(0.0, min(end, right) - max(start, left)) for left, right in playback_intervals)
+        turn = {
+            "origin": "human" if overlap / duration < 0.1 else "unknown",
+            "speaker_id": None,
+            "start_seconds": round(start, 3),
+            "end_seconds": round(end, 3),
+            "confidence": 0.8 if overlap / duration < 0.1 else 0.5,
+            "transcript": None,
+            "evidence": ["fsmn_vad", "no_device_playback_overlap"] if overlap / duration < 0.1 else ["fsmn_vad", "device_playback_temporal_overlap", "aec_not_yet_applied"],
+        }
+        turns.append(turn)
+        (human_turns if turn["origin"] == "human" else unknown_turns).append(turn)
+    first_playback = min(start for start, _ in playback_intervals)
+    dialogue_lead = any(0 <= first_playback - item["end_seconds"] <= 5 for item in human_turns)
+    if dialogue_lead:
+        scene_type = "xiaoai_dialogue"
+    elif human_turns or unknown_turns:
+        scene_type = "mixed"
+    else:
+        scene_type = "device_playback"
+    return {
+        "scene_type": scene_type,
+        "interaction_id": f"xiaoai-dialogue:{identity[:20]}" if dialogue_lead else f"playback-scene:{identity[:20]}",
+        "confidence": 0.75 if dialogue_lead else 0.7,
+        "needs_review": bool(dialogue_lead or unknown_turns),
+        "playback_reference": {
+            "available": True,
+            "coverage": round(min(1.0, playback_seconds / max(0.001, event_duration_seconds)), 4),
+            "source": "oh2p-alsa-default-playback-pcm",
+        },
+        "turns": sorted(turns, key=lambda item: (item["start_seconds"], item["origin"])),
     }
 
 
@@ -666,6 +769,26 @@ class EvidenceProcessor:
                 "sources": [item["sha256"] for item in refs],
                 "segments": owned_segments,
             }, sort_keys=True).encode("utf-8")).hexdigest()
+            playback_matches = playback_matches_for_window(
+                occurred,
+                ended,
+                self.args.playback_dir,
+                self.args.playback_nas_uri_root,
+            )
+            playback_refs = [{
+                key: item[key]
+                for key in ("uri", "sha256", "offset_start_seconds", "offset_end_seconds")
+            } for item in playback_matches]
+            speech_segments_seconds = [
+                (max(0, start - event_start_ms) / 1000, max(0, end - event_start_ms) / 1000)
+                for start, end in owned_segments
+            ]
+            acoustic_scene = acoustic_scene_with_playback(
+                identity,
+                (event_end_ms - event_start_ms) / 1000,
+                speech_segments_seconds,
+                playback_matches,
+            )
 
             comparisons = [normalized_agreement(primary, text) for text in texts if text]
             score = sum(comparisons) / len(comparisons) if comparisons else 0.0
@@ -678,6 +801,7 @@ class EvidenceProcessor:
                 "audio_ref": refs[0]["uri"],
                 "audio_sha256": digest,
                 "audio_refs": refs,
+                "playback_refs": playback_refs,
                 "transcript": primary,
                 "language": "zh",
                 "alternatives": [
@@ -685,7 +809,7 @@ class EvidenceProcessor:
                     for text in texts if text
                 ],
                 "speakers": filtered_speakers,
-                "acoustic_scene": acoustic_scene_without_reference(),
+                "acoustic_scene": acoustic_scene,
                 "reliability": {
                     "agreement": agreement,
                     "score": round(score, 4),
@@ -710,7 +834,8 @@ class EvidenceProcessor:
                         "lookahead_used": lookahead is not None,
                         "boundary_ownership": "utterance_start",
                         "carried_from_previous_until_ms": int(carry.get("until_ms", 0) or 0),
-                        "playback_reference_archived": False,
+                        "playback_reference_archived": bool(playback_refs),
+                        "playback_reference_count": len(playback_refs),
                     },
                     "speaker_diarization": {
                         "status": diarization_status,

@@ -8,6 +8,7 @@ RequiresMountsFor=/mnt/dx4600
 Type=simple
 WorkingDirectory=%h/vscode/open-xiaoai
 EnvironmentFile=%h/.config/open-xiaoai-recorder/env
+EnvironmentFile=%h/.config/open-xiaoai-recorder/playback.env
 Environment=CUDA_VISIBLE_DEVICES=
 ExecStart=%h/.venvs/qwen3-asr/bin/python %h/vscode/open-xiaoai/processor.py
 Restart=always
