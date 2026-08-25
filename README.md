@@ -4,12 +4,13 @@
 
 ## 数据链路
 
-1. `recorder.py` 只建立一条长期 SSH/`arecord` 音频流，以准确的样本数切成 60 秒临时段；切段时不会重新连接音箱。
+1. `recorder.py` 只建立一条长期 SSH/`arecord` 音频流，以准确的样本数切成 60 秒存储块；切段时不会重新连接音箱，因此边界处没有采集空洞。
 2. 原音以 `48 kHz / 3 通道 / 24-bit FLAC` 无损保存。硬件提供四路 PCM，其中第四路恒为零，因此不归档。
 3. `processor.py` 分别检查三支麦克风。FSMN-VAD/SenseVoice 判断没有语音的段先隔离 72 小时，核对哈希后才删除；分类清单永久留下。若只有一路被噪声误触发、而 Qwen 主转写为空，也按 `no_reliable_speech` 进入同样的可恢复隔离。
-4. 有语音的整段原音进入 `evidence/`。FSMN-VAD 先给出毫秒级语音区间，并只把这些区间（两端各保留 200 ms）拼接给 CPU 上的 Qwen3-ASR-1.7B；原始 60 秒三通道音频完全不裁剪。SenseVoiceSmall 从三路麦克风独立生成候选，字符一致度只用于提示风险。单段 Qwen 默认最多运行 45 秒，避免噪声触发长幻觉并卡住队列；超时原音永久保留为 `.processing_failed.json`，不向 Agent 发布错误文本。
-5. sherpa-onnx 用 Pyannote segmentation + 中文 3D-Speaker 在 CPU 上给出仅在当前录音内有效的匿名说话人片段；它不会猜姓名、性别，也不会把不同录音的 `speaker-00` 当成同一个人。
-6. 事件连同模型、运行设备、候选文本、原音 SHA-256 和 NAS 地址发给 Zeris。临时上报失败时保留 `.event.pending.json`，以 15 秒至 15 分钟指数退避重试；每个事件独立处理，一个坏事件不会阻塞之后的 VAD、转写或上报。永久拒绝的事件标为 `.event.rejected.json`，原音保留供人工复核。
+4. 处理器会等待下一分钟落盘，再把“当前块 + 下一块”作为连续窗口运行 FSMN-VAD。话语按开始时间唯一归属：若从当前块末尾说到下一块开头，上一事件取得完整尾巴，持久化 carry 状态让下一块不重复转写；采集停止时，最后一块等待 75 秒后自动降级为单块处理。
+5. 有语音的整段原音进入 `evidence/`。只把毫秒级语音区间（两端各保留 200 ms）拼接给 CPU 上的 Qwen3-ASR-1.7B；原始 60 秒三通道音频完全不裁剪。跨界事件携带所有相关 FLAC 的 NAS URI、SHA-256 和块内偏移，能够重建并校验原话。SenseVoiceSmall 从三路麦克风独立生成候选，字符一致度只用于提示风险。单段 Qwen 默认最多运行 45 秒，避免噪声触发长幻觉并卡住队列；超时原音永久保留为 `.processing_failed.json`，不向 Agent 发布错误文本。
+6. sherpa-onnx 用 Pyannote segmentation + 中文 3D-Speaker 在 CPU 上给出仅在当前录音内有效的匿名说话人片段；它不会猜姓名、性别，也不会把不同录音的 `speaker-00` 当成同一个人。
+7. 事件连同模型、运行设备、候选文本、原音 SHA-256 和 NAS 地址发给 Zeris。临时上报失败时保留 `.event.pending.json`，以 15 秒至 15 分钟指数退避重试；每个事件独立处理，一个坏事件不会阻塞之后的 VAD、转写或上报。永久拒绝的事件标为 `.event.rejected.json`，原音保留供人工复核。
 
 转写永远是 `fallible_asr`（可能听错的二手证据），不是事实。涉及时间、金额、医疗、门锁、承诺等高影响内容时，Agent 必须结合上下文、回听原音或询问家庭成员，不能仅凭转写执行。
 
@@ -20,6 +21,10 @@
 - 10 秒三通道无损 FLAC 约 3.3 MiB，即未经筛选约 28–30 GiB/天。NAS 临时承接全部原音，处理成功后只长期保留含语音的证据段。
 
 数字是当前 i7-12700 主机上的一次实测，不是性能承诺。N5105 小主机内存不足以舒适常驻 1.7B float32 模型，因此转写服务部署在当前主机，Zeris 仍运行在小主机。
+
+## 分段方案依据
+
+没有把录音文件本身改成“遇到静音才落盘”：无限延长或异常 VAD 都会让原始文件难恢复。当前采用开源流式 ASR 常见的双层结构——固定大小的可靠存储块，加上有状态的语音端点层。实现复用现有 FSMN-VAD；设计参考 [FunASR 的流式 FSMN-VAD 与 lookback 会话](https://github.com/modelscope/FunASR/blob/main/funasr/bin/realtime_ws.py) 和 [Silero VAD 的流式 `VADIterator`](https://github.com/snakers4/silero-vad)。Silero 适合作为未来异构复核，但当前不额外引入第二套运行时，避免两个 VAD 的边界规则互相冲突。
 
 ## 依赖与模型
 
