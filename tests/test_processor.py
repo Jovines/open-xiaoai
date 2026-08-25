@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from processor import (
+    asr_reliability,
     EventPostError,
     EvidenceProcessor,
     TranscriptionTimeout,
@@ -45,6 +46,17 @@ class ProcessorTests(unittest.TestCase):
 
     def test_agreement_ignores_spacing_and_punctuation(self):
         self.assertEqual(normalized_agreement("明天，交水费。", "明天交水费"), 1.0)
+
+    def test_one_character_model_conflict_requires_review(self):
+        result = asr_reliability("小爱仍有功能", ["小爱原有功能"] * 3)
+        self.assertEqual(result["agreement"], "medium")
+        self.assertTrue(result["needs_review"])
+
+    def test_exact_three_microphone_consensus_is_high_but_not_infallible(self):
+        result = asr_reliability("明天交水费", ["明天，交水费。"] * 3)
+        self.assertEqual(result["agreement"], "high")
+        self.assertFalse(result["needs_review"])
+        self.assertIn("仍可能听错", result["notes"])
 
     def test_missing_playback_reference_never_claims_a_speaker_origin(self):
         scene = acoustic_scene_without_reference()

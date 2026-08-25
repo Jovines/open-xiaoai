@@ -77,6 +77,31 @@ def normalized_agreement(left: str, right: str) -> float:
     return difflib.SequenceMatcher(None, a, b).ratio()
 
 
+def asr_reliability(primary: str, alternatives: list[str]) -> dict:
+    """Do not let a high fuzzy score hide a potentially critical word conflict."""
+    clean = lambda value: re.sub(r"[\W_]+", "", value, flags=re.UNICODE).lower()
+    active = [text for text in alternatives if clean(text)]
+    comparisons = [normalized_agreement(primary, text) for text in active]
+    score = sum(comparisons) / len(comparisons) if comparisons else 0.0
+    exact_consensus = len(active) == 3 and all(clean(primary) == clean(text) for text in active)
+    if exact_consensus:
+        agreement = "high"
+    elif score >= 0.65:
+        agreement = "medium"
+    else:
+        agreement = "low"
+    return {
+        "agreement": agreement,
+        "score": round(score, 4),
+        "needs_review": not exact_consensus,
+        "notes": (
+            "两种 ASR 与三路麦克风文本完全一致；机器转写仍可能听错，高影响事项必须复核。"
+            if exact_consensus
+            else "ASR 候选存在文本冲突；不得按整体相似度忽略单字差异，高影响事项必须回听或询问。"
+        ),
+    }
+
+
 def acoustic_scene_without_reference() -> dict:
     """State explicitly that speaker-origin attribution has not been performed."""
     return {
@@ -790,9 +815,7 @@ class EvidenceProcessor:
                 playback_matches,
             )
 
-            comparisons = [normalized_agreement(primary, text) for text in texts if text]
-            score = sum(comparisons) / len(comparisons) if comparisons else 0.0
-            agreement = "high" if score >= 0.88 else "medium" if score >= 0.65 else "low"
+            reliability = asr_reliability(primary, texts)
             event = {
                 "event_id": f"audio-{identity[:24]}",
                 "occurred_at": occurred.isoformat(),
@@ -810,12 +833,7 @@ class EvidenceProcessor:
                 ],
                 "speakers": filtered_speakers,
                 "acoustic_scene": acoustic_scene,
-                "reliability": {
-                    "agreement": agreement,
-                    "score": round(score, 4),
-                    "needs_review": agreement == "low",
-                    "notes": "机器转写可能听错；高影响事项必须回听原音或向家庭成员确认。",
-                },
+                "reliability": reliability,
                 "provenance": {
                     "schema_version": 1,
                     "evidence_kind": "fallible_asr",
