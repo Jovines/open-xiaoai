@@ -5,10 +5,10 @@
 ## 数据链路
 
 1. `recorder.py` 只建立一条长期 SSH/`arecord` 音频流，以准确的样本数切成 60 秒存储块；切段时不会重新连接音箱，因此边界处没有采集空洞。
-2. 原音以 `48 kHz / 3 通道 / 24-bit FLAC` 无损保存。硬件提供四路 PCM，其中第四路恒为零，因此不归档。
+2. 原音以 `48 kHz / 3 通道 / 24-bit FLAC` 无损保存。硬件提供四路 PCM，其中第四路恒为零，因此不归档。A113 低位样本使用 `×96` 映射，在受控外放中相对旧 `×256` 将削波减少约 560 倍，同时保留约 8.5 dB 头部空间。
 3. `processor.py` 分别检查三支麦克风。FSMN-VAD/SenseVoice 判断没有语音的段先隔离 72 小时，核对哈希后才删除；分类清单永久留下。若只有一路被噪声误触发、而 Qwen 主转写为空，也按 `no_reliable_speech` 进入同样的可恢复隔离。
 4. 处理器会等待下一分钟落盘，再把“当前块 + 下一块”作为连续窗口运行 FSMN-VAD。话语按开始时间唯一归属：若从当前块末尾说到下一块开头，上一事件取得完整尾巴，持久化 carry 状态让下一块不重复转写；采集停止时，最后一块等待 75 秒后自动降级为单块处理。
-5. 有语音的整段原音进入 `evidence/`。只把毫秒级语音区间（两端各保留 200 ms）拼接给 CPU 上的 Qwen3-ASR-1.7B；原始 60 秒三通道音频完全不裁剪。跨界事件携带所有相关 FLAC 的 NAS URI、SHA-256 和块内偏移，能够重建并校验原话。SenseVoiceSmall 从三路麦克风独立生成候选，字符一致度只用于提示风险。单段 Qwen 默认最多运行 45 秒，避免噪声触发长幻觉并卡住队列；超时原音永久保留为 `.processing_failed.json`，不向 Agent 发布错误文本。
+5. 有语音的整段原音进入 `evidence/`。只把毫秒级语音区间（两端各保留 200 ms）拼接给 CPU 上的 Qwen3-ASR-1.7B；原始 60 秒三通道音频完全不裁剪。跨界事件携带所有相关 FLAC 的 NAS URI、SHA-256 和块内偏移，能够重建并校验原话。SenseVoiceSmall 从三路麦克风独立生成候选；只有 Qwen 与三路候选归一化后完全一致才算高一致度，任何单字冲突都强制 `needs_review`。单段 Qwen 默认最多运行 45 秒，避免噪声触发长幻觉并卡住队列；超时原音永久保留为 `.processing_failed.json`，不向 Agent 发布错误文本。
 6. sherpa-onnx 用 Pyannote segmentation + 中文 3D-Speaker 在 CPU 上给出仅在当前录音内有效的匿名说话人片段；它不会猜姓名、性别，也不会把不同录音的 `speaker-00` 当成同一个人。
 7. 事件连同模型、运行设备、候选文本、原音 SHA-256 和 NAS 地址发给 Zeris。临时上报失败时保留 `.event.pending.json`，以 15 秒至 15 分钟指数退避重试；每个事件独立处理，一个坏事件不会阻塞之后的 VAD、转写或上报。永久拒绝的事件标为 `.event.rejected.json`，原音保留供人工复核。
 
@@ -17,6 +17,8 @@
 播放 reference canary 已从默认 PCM 的 `pcm.vis` 旁路无损归档到 NAS；处理器会把与麦克风事件重叠的 `playback_refs[]` 交给 Zeris，并按 `human | xiaoai_output | unknown` 形成保守 turn。受控“小爱问答 + 播放时插话”验收完成前，重叠近端声音不会冒充已确认的 `overlap`；没有 reference 的事件仍明确标为 `acoustic_scene.scene_type=unknown`、`playback_reference.available=false`。
 
 OH2P 声卡拓扑、原厂进程边界、播放 fan-out 协议、内核兼容踩坑、验收与回滚门禁统一记录在 [`docs/oh2p-audio-integration.md`](docs/oh2p-audio-integration.md)。经验文档是后续实现的依据，不能只留在聊天记录里。
+
+中文 ASR 的可复现清单、micro-CER、关键短语、稳定性、CPU RTF 与削波评测见 [`evaluation/README.md`](evaluation/README.md)。音频与机器报告保存在 NAS，Git 只保存无隐私标签、哈希和运行代码。
 
 ## 实测基线
 
@@ -65,6 +67,7 @@ SSHPASS=open-xiaoai python3 recorder.py \
 | `RECORDER_SEGMENT_SECONDS` | `60` | 临时段秒数 |
 | `RECORDER_SAMPLE_RATE` | `48000` | 采样率 |
 | `RECORDER_ARCHIVE_CHANNELS` | `3` | 三路有效麦克风 |
+| `RECORDER_PCM_GAIN` | `96` | A113 低位样本增益；相对完整映射保留约 8.5 dB 防削波余量 |
 | `RECORDER_CODEC` | `flac` | 生产使用无损 FLAC |
 | `RECORDER_MIN_FREE_GB` | `5` | 低磁盘余量时暂停 |
 | `SSHPASS` | 无 | 音箱 SSH 密码；推荐最终换成密钥 |
