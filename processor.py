@@ -45,6 +45,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--required-mount", type=Path, default=Path(os.environ.get("PROCESSOR_REQUIRED_MOUNT", "/mnt/dx4600")))
     parser.add_argument("--nas-uri-root", default=os.environ.get("PROCESSOR_NAS_URI_ROOT", "nas://dx4600/家庭管家/录音/evidence"))
     parser.add_argument("--sense-binary", type=Path, default=Path(os.environ.get("SENSEVOICE_BINARY", str(Path.home() / ".local/opt/sensevoice/llama-funasr-sensevoice"))))
+    parser.add_argument("--vad-binary", type=Path, default=Path(os.environ.get("FSMN_VAD_BINARY", str(Path.home() / ".local/opt/sensevoice/llama-funasr-vad"))))
     parser.add_argument("--sense-model", type=Path, default=Path(os.environ.get("SENSEVOICE_MODEL", str(Path.home() / "models/sensevoice-small/sensevoice-small-q8.gguf"))))
     parser.add_argument("--vad-model", type=Path, default=Path(os.environ.get("SENSEVOICE_VAD_MODEL", str(Path.home() / "models/sensevoice-small/fsmn-vad.gguf"))))
     parser.add_argument("--qwen-model", default=os.environ.get("QWEN_ASR_MODEL", "Qwen/Qwen3-ASR-1.7B"))
@@ -146,6 +147,57 @@ def sensevoice(binary: Path, model: Path, vad: Path, audio: Path) -> tuple[int, 
     return segments, " ".join(text_lines)
 
 
+def vad_segments(binary: Path, model: Path, audio: Path) -> list[tuple[int, int]]:
+    """Return FSMN-VAD intervals as millisecond pairs."""
+    result = subprocess.run(
+        [str(binary), "-m", str(model), "-a", str(audio)],
+        check=True, capture_output=True, text=True,
+    )
+    combined = "\n".join((result.stdout, result.stderr))
+    segments = []
+    for line in combined.splitlines():
+        match = re.fullmatch(r"\s*(\d+)\s+(\d+)\s*", line)
+        if match:
+            start, end = (int(match.group(1)), int(match.group(2)))
+            if end > start:
+                segments.append((start, end))
+    return segments
+
+
+def merge_vad_segments(segments: list[tuple[int, int]], padding_ms: int = 200) -> list[tuple[int, int]]:
+    """Pad and merge speech intervals so consonants at VAD edges are not clipped."""
+    merged: list[list[int]] = []
+    for raw_start, raw_end in sorted(segments):
+        start = max(0, raw_start - padding_ms)
+        end = raw_end + padding_ms
+        if merged and start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    return [(start, end) for start, end in merged]
+
+
+def extract_speech_audio(source: Path, destination: Path, segments: list[tuple[int, int]]) -> None:
+    """Concatenate only VAD-positive regions into a compact ASR input."""
+    merged = merge_vad_segments(segments)
+    if not merged:
+        raise ValueError("cannot extract speech without VAD segments")
+    filters = []
+    inputs = []
+    for index, (start, end) in enumerate(merged):
+        filters.append(
+            f"[0:a]atrim=start={start / 1000:.3f}:end={end / 1000:.3f},"
+            f"asetpts=PTS-STARTPTS[s{index}]"
+        )
+        inputs.append(f"[s{index}]")
+    filters.append(f"{''.join(inputs)}concat=n={len(merged)}:v=0:a=1[out]")
+    subprocess.run([
+        "ffmpeg", "-v", "error", "-y", "-i", str(source),
+        "-filter_complex", ";".join(filters), "-map", "[out]",
+        "-ar", "16000", "-ac", "1", str(destination),
+    ], check=True)
+
+
 class EvidenceProcessor:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
@@ -159,7 +211,7 @@ class EvidenceProcessor:
         for program in ("ffmpeg", "ffprobe"):
             if not shutil.which(program):
                 raise RuntimeError(f"缺少依赖程序：{program}")
-        for path in (self.args.sense_binary, self.args.sense_model, self.args.vad_model):
+        for path in (self.args.sense_binary, self.args.vad_binary, self.args.sense_model, self.args.vad_model):
             if not path.is_file():
                 raise RuntimeError(f"缺少模型或程序：{path}")
         self.args.input_dir.mkdir(parents=True, exist_ok=True)
@@ -383,8 +435,23 @@ class EvidenceProcessor:
 
             texts = [text for _, text in sense_results]
             channel = choose_microphone(texts)
+            speech_segments = vad_segments(self.args.vad_binary, self.args.vad_model, microphones[channel])
+            if not speech_segments:
+                self.quarantine_audio(
+                    source,
+                    classification="no_reliable_speech",
+                    classifier={
+                        "model": "SenseVoiceSmall-Q8",
+                        "vad": "FSMN-VAD",
+                        "reason": "selected_channel_has_no_vad_intervals",
+                        "selected_microphone": channel,
+                    },
+                )
+                return "discarded"
+            speech_audio = Path(temporary) / "selected-speech-only.wav"
+            extract_speech_audio(microphones[channel], speech_audio, speech_segments)
             try:
-                primary = self.qwen_transcribe(microphones[channel])
+                primary = self.qwen_transcribe(speech_audio)
             except TranscriptionTimeout as error:
                 self.preserve_processing_failure(
                     source,
@@ -394,6 +461,7 @@ class EvidenceProcessor:
                         "device": "cpu",
                         "timeout_seconds": self.args.qwen_timeout_seconds,
                         "selected_microphone": channel,
+                        "speech_segments_ms": speech_segments,
                         "sensevoice_transcripts": texts,
                         "error": str(error),
                     },
@@ -453,7 +521,14 @@ class EvidenceProcessor:
                 "provenance": {
                     "schema_version": 1,
                     "evidence_kind": "fallible_asr",
-                    "primary_asr": {"model": "Qwen3-ASR-1.7B", "runtime": "qwen-asr", "device": "cpu", "selected_microphone": channel},
+                    "primary_asr": {
+                        "model": "Qwen3-ASR-1.7B",
+                        "runtime": "qwen-asr",
+                        "device": "cpu",
+                        "selected_microphone": channel,
+                        "input": "fsmn_vad_speech_regions_concatenated",
+                        "speech_segments_ms": speech_segments,
+                    },
                     "cross_check": {"model": "SenseVoiceSmall-Q8", "vad": "FSMN-VAD", "all_microphone_transcripts": texts},
                     "audio": audio,
                     "speaker_diarization": {

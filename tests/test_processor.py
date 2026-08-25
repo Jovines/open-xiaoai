@@ -13,8 +13,11 @@ from processor import (
     atomic_json,
     audio_properties,
     choose_microphone,
+    extract_speech_audio,
+    merge_vad_segments,
     normalized_agreement,
     parse_capture_time,
+    vad_segments,
 )
 
 
@@ -61,6 +64,32 @@ class ProcessorTests(unittest.TestCase):
             self.assertEqual(properties["sample_rate"], 16000)
             self.assertEqual(properties["channels"], 1)
             self.assertAlmostEqual(properties["duration_seconds"], 0.25, places=2)
+
+    def test_vad_segments_parses_only_valid_intervals(self):
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=0,
+            stdout="[vad] 2 segments (max_seg=30000ms)\n100 500\n900 1300\ninvalid\n",
+            stderr="",
+        )
+        with mock.patch("processor.subprocess.run", return_value=completed):
+            self.assertEqual(
+                vad_segments(Path("vad"), Path("model"), Path("audio.wav")),
+                [(100, 500), (900, 1300)],
+            )
+
+    def test_vad_padding_merges_overlapping_intervals(self):
+        self.assertEqual(merge_vad_segments([(100, 500), (600, 900), (2000, 2100)]), [(0, 1100), (1800, 2300)])
+
+    def test_speech_extraction_removes_long_silence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source.wav"
+            output = Path(directory) / "speech.wav"
+            subprocess.run([
+                "ffmpeg", "-v", "error", "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=16000",
+                "-t", "2", str(source),
+            ], check=True)
+            extract_speech_audio(source, output, [(200, 500), (1500, 1800)])
+            self.assertAlmostEqual(audio_properties(output)["duration_seconds"], 1.4, places=1)
 
     def test_empty_primary_with_one_active_channel_is_noise_false_positive(self):
         event = {
