@@ -9,6 +9,10 @@ Type=simple
 WorkingDirectory=%h/vscode/open-xiaoai
 EnvironmentFile=%h/.config/open-xiaoai-recorder/env
 ExecStart=/usr/bin/python3 %h/vscode/open-xiaoai/recorder.py
+# SIGTERM only reaches the Python supervisor first, allowing it to close SSH and
+# let ffmpeg finalize the current partial FLAC. SIGKILL still covers the cgroup.
+KillMode=mixed
+TimeoutStopSec=15
 Restart=always
 RestartSec=5
 
