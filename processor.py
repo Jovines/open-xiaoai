@@ -15,6 +15,7 @@ import re
 import signal
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import urllib.error
@@ -53,6 +54,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--qwen-model", default=os.environ.get("QWEN_ASR_MODEL", "Qwen/Qwen3-ASR-1.7B"))
     parser.add_argument("--qwen-timeout-seconds", type=float, default=float(os.environ.get("QWEN_ASR_TIMEOUT_SECONDS", "45")))
     parser.add_argument("--qwen-max-new-tokens", type=int, default=int(os.environ.get("QWEN_ASR_MAX_NEW_TOKENS", "384")))
+    parser.add_argument("--firered-enabled", action=argparse.BooleanOptionalAction, default=os.environ.get("FIRERED_ASR_ENABLED", "0").lower() in {"1", "true", "yes", "on"})
+    parser.add_argument("--firered-python", type=Path, default=Path(os.environ.get("FIRERED_ASR_PYTHON", sys.executable)))
+    parser.add_argument("--firered-script", type=Path, default=Path(os.environ.get("FIRERED_ASR_SCRIPT", str(Path(__file__).parent / "scripts/firered_transcribe.py"))))
+    parser.add_argument("--firered-source-dir", type=Path, default=Path(os.environ.get("FIRERED_ASR_SOURCE_DIR", str(Path.home() / ".local/opt/fireredasr2s"))))
+    parser.add_argument("--firered-deps-dir", type=Path, default=Path(os.environ.get("FIRERED_ASR_DEPS_DIR", str(Path.home() / ".local/opt/fireredasr2-deps-py312"))))
+    parser.add_argument("--firered-model-dir", type=Path, default=Path(os.environ.get("FIRERED_ASR_MODEL_DIR", str(Path.home() / "models/fireredasr2-aed"))))
+    parser.add_argument("--firered-timeout-seconds", type=float, default=float(os.environ.get("FIRERED_ASR_TIMEOUT_SECONDS", "45")))
     parser.add_argument("--diarization-python", type=Path, default=Path(os.environ.get("DIARIZATION_PYTHON", str(Path.home() / ".venvs/sherpa-onnx/bin/python"))))
     parser.add_argument("--diarization-script", type=Path, default=Path(os.environ.get("DIARIZATION_SCRIPT", str(Path(__file__).with_name("diarize.py")))))
     parser.add_argument("--diarization-segmentation", type=Path, default=Path(os.environ.get("DIARIZATION_SEGMENTATION_MODEL", str(Path.home() / "models/speaker-diarization/sherpa-onnx-pyannote-segmentation-3-0/model.onnx"))))
@@ -69,9 +77,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def normalize_asr_text(value: str) -> str:
+    return re.sub(r"[\W_]+", "", value, flags=re.UNICODE).lower()
+
+
 def normalized_agreement(left: str, right: str) -> float:
-    clean = lambda value: re.sub(r"[\W_]+", "", value, flags=re.UNICODE).lower()
-    a, b = clean(left), clean(right)
+    a, b = normalize_asr_text(left), normalize_asr_text(right)
     if not a or not b:
         return 0.0
     return difflib.SequenceMatcher(None, a, b).ratio()
@@ -79,11 +90,10 @@ def normalized_agreement(left: str, right: str) -> float:
 
 def asr_reliability(primary: str, alternatives: list[str]) -> dict:
     """Do not let a high fuzzy score hide a potentially critical word conflict."""
-    clean = lambda value: re.sub(r"[\W_]+", "", value, flags=re.UNICODE).lower()
-    active = [text for text in alternatives if clean(text)]
+    active = [text for text in alternatives if normalize_asr_text(text)]
     comparisons = [normalized_agreement(primary, text) for text in active]
     score = sum(comparisons) / len(comparisons) if comparisons else 0.0
-    exact_consensus = len(active) == 3 and all(clean(primary) == clean(text) for text in active)
+    exact_consensus = len(active) == 3 and all(normalize_asr_text(primary) == normalize_asr_text(text) for text in active)
     if exact_consensus:
         agreement = "high"
     elif score >= 0.65:
@@ -100,6 +110,30 @@ def asr_reliability(primary: str, alternatives: list[str]) -> dict:
             else "ASR 候选存在文本冲突；不得按整体相似度忽略单字差异，高影响事项必须回听或询问。"
         ),
     }
+
+
+def sensevoice_consensus(alternatives: list[str]) -> str | None:
+    """Return the representative text only when all three microphones agree exactly."""
+    active = [text for text in alternatives if normalize_asr_text(text)]
+    if len(active) != 3:
+        return None
+    normalized = normalize_asr_text(active[0])
+    return active[0] if all(normalize_asr_text(text) == normalized for text in active[1:]) else None
+
+
+def apply_asr_adjudication(primary: str, alternatives: list[str], adjudicator_text: str | None) -> tuple[str, str]:
+    """Choose only when an independent adjudicator breaks a strong model conflict."""
+    consensus = sensevoice_consensus(alternatives)
+    if consensus is None or normalize_asr_text(primary) == normalize_asr_text(consensus):
+        return primary, "not_applicable"
+    if not adjudicator_text:
+        return primary, "unavailable"
+    normalized_adjudicator = normalize_asr_text(adjudicator_text)
+    if normalized_adjudicator == normalize_asr_text(consensus):
+        return consensus, "sensevoice_consensus_confirmed"
+    if normalized_adjudicator == normalize_asr_text(primary):
+        return primary, "primary_confirmed"
+    return primary, "three_way_conflict"
 
 
 def acoustic_scene_without_reference() -> dict:
@@ -434,6 +468,18 @@ class EvidenceProcessor:
         for path in (self.args.sense_binary, self.args.vad_binary, self.args.sense_model, self.args.vad_model):
             if not path.is_file():
                 raise RuntimeError(f"缺少模型或程序：{path}")
+        if self.args.firered_enabled:
+            required = (
+                self.args.firered_python,
+                self.args.firered_script,
+                self.args.firered_source_dir / "fireredasr2s/fireredasr2/asr.py",
+                self.args.firered_model_dir / "model.pth.tar",
+            )
+            for path in required:
+                if not path.is_file():
+                    raise RuntimeError(f"缺少 FireRed 仲裁程序或模型：{path}")
+            if not self.args.firered_deps_dir.is_dir():
+                raise RuntimeError(f"缺少 FireRed Python 依赖目录：{self.args.firered_deps_dir}")
         self.args.input_dir.mkdir(parents=True, exist_ok=True)
         self.args.evidence_dir.mkdir(parents=True, exist_ok=True)
         self.args.discard_dir.mkdir(parents=True, exist_ok=True)
@@ -469,6 +515,25 @@ class EvidenceProcessor:
         finally:
             signal.setitimer(signal.ITIMER_REAL, 0)
             signal.signal(signal.SIGALRM, previous_handler)
+
+    def firered_transcribe(self, audio: Path) -> dict | None:
+        """Run the memory-heavy model out of process so its RAM is reclaimed."""
+        if not self.args.firered_enabled:
+            return None
+        try:
+            result = subprocess.run([
+                str(self.args.firered_python), str(self.args.firered_script),
+                "--audio", str(audio),
+                "--source-dir", str(self.args.firered_source_dir),
+                "--deps-dir", str(self.args.firered_deps_dir),
+                "--model-dir", str(self.args.firered_model_dir),
+            ], check=True, capture_output=True, text=True, timeout=self.args.firered_timeout_seconds)
+            lines = [line for line in result.stdout.splitlines() if line.strip()]
+            payload = json.loads(lines[-1])
+            return payload if isinstance(payload, dict) else None
+        except (subprocess.SubprocessError, OSError, ValueError, json.JSONDecodeError) as error:
+            logging.warning("FireRed 按需仲裁失败，保留 Qwen 主结果和 SenseVoice 候选：%s", error)
+            return None
 
     def diarize(self, audio: Path) -> tuple[list[dict], str]:
         required = (
@@ -758,6 +823,18 @@ class EvidenceProcessor:
                 self.consume_carry(source)
                 return "discarded"
 
+            consensus = sensevoice_consensus(texts)
+            firered = None
+            adjudication_triggered = consensus is not None and normalize_asr_text(primary) != normalize_asr_text(consensus)
+            adjudication_attempted = adjudication_triggered and self.args.firered_enabled
+            if adjudication_triggered:
+                firered = self.firered_transcribe(speech_microphones[channel])
+            selected_transcript, adjudication_result = apply_asr_adjudication(
+                primary,
+                texts,
+                firered.get("text") if firered else None,
+            )
+
             speakers, diarization_status = self.diarize(microphones[channel])
             event_start_ms = min(start for start, _ in owned_segments)
             event_end_ms = max(end for _, end in owned_segments)
@@ -816,6 +893,20 @@ class EvidenceProcessor:
             )
 
             reliability = asr_reliability(primary, texts)
+            if adjudication_result == "sensevoice_consensus_confirmed":
+                reliability["notes"] += " FireRed 独立复核支持三麦 SenseVoice 共识，已将其作为展示文本；原始模型冲突仍需保留并可回听。"
+            alternatives = [
+                {"model": "SenseVoiceSmall", "version": "Q8-GGUF", "text": text}
+                for text in texts if text
+            ]
+            if normalize_asr_text(selected_transcript) != normalize_asr_text(primary):
+                alternatives.insert(0, {"model": "Qwen3-ASR", "version": "1.7B-CPU-FP32", "text": primary})
+            elif firered and firered.get("text"):
+                alternatives.append({
+                    "model": "FireRedASR2-AED",
+                    "version": "FP32-CPU",
+                    "text": firered["text"],
+                })
             event = {
                 "event_id": f"audio-{identity[:24]}",
                 "occurred_at": occurred.isoformat(),
@@ -825,12 +916,9 @@ class EvidenceProcessor:
                 "audio_sha256": digest,
                 "audio_refs": refs,
                 "playback_refs": playback_refs,
-                "transcript": primary,
+                "transcript": selected_transcript,
                 "language": "zh",
-                "alternatives": [
-                    {"model": "SenseVoiceSmall", "version": "Q8-GGUF", "text": text}
-                    for text in texts if text
-                ],
+                "alternatives": alternatives,
                 "speakers": filtered_speakers,
                 "acoustic_scene": acoustic_scene,
                 "reliability": reliability,
@@ -846,6 +934,21 @@ class EvidenceProcessor:
                         "speech_segments_ms": owned_segments,
                     },
                     "cross_check": {"model": "SenseVoiceSmall-Q8", "vad": "FSMN-VAD", "all_microphone_transcripts": texts},
+                    "adjudication": {
+                        "enabled": self.args.firered_enabled,
+                        "trigger": "three_microphone_sensevoice_consensus_conflicts_with_qwen",
+                        "triggered": adjudication_triggered,
+                        "attempted": adjudication_attempted,
+                        "completed": firered is not None,
+                        "model": "FireRedASR2-AED",
+                        "device": "cpu",
+                        "result": adjudication_result,
+                        "text": firered.get("text") if firered else None,
+                        "confidence": firered.get("confidence") if firered else None,
+                        "timestamps": firered.get("timestamps", []) if firered else [],
+                        "load_seconds": firered.get("load_seconds") if firered else None,
+                        "inference_seconds": firered.get("inference_seconds") if firered else None,
+                    },
                     "audio": {
                         "storage_blocks": properties,
                         "fixed_block_seconds": properties[0]["duration_seconds"],

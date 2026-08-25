@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from processor import (
+    apply_asr_adjudication,
     asr_reliability,
     EventPostError,
     EvidenceProcessor,
@@ -25,6 +26,7 @@ from processor import (
     owned_vad_segments,
     parse_capture_time,
     playback_matches_for_window,
+    sensevoice_consensus,
     vad_segments,
 )
 
@@ -42,6 +44,13 @@ class ProcessorTests(unittest.TestCase):
             zeris_token="test",
             qwen_timeout_seconds=0.02,
             qwen_max_new_tokens=384,
+            firered_enabled=True,
+            firered_python=root / "python",
+            firered_script=root / "firered_transcribe.py",
+            firered_source_dir=root / "source",
+            firered_deps_dir=root / "deps",
+            firered_model_dir=root / "model",
+            firered_timeout_seconds=45,
         ))
 
     def test_agreement_ignores_spacing_and_punctuation(self):
@@ -57,6 +66,21 @@ class ProcessorTests(unittest.TestCase):
         self.assertEqual(result["agreement"], "high")
         self.assertFalse(result["needs_review"])
         self.assertIn("仍可能听错", result["notes"])
+
+    def test_fire_red_can_confirm_three_microphone_consensus(self):
+        alternatives = ["小爱原有功能"] * 3
+        self.assertEqual(sensevoice_consensus(alternatives), "小爱原有功能")
+        selected, result = apply_asr_adjudication("小爱仍有功能", alternatives, "小爱原有功能")
+        self.assertEqual(selected, "小爱原有功能")
+        self.assertEqual(result, "sensevoice_consensus_confirmed")
+
+    def test_fire_red_disagreement_never_silently_rewrites_primary(self):
+        selected, result = apply_asr_adjudication("明天交水费", ["明天交电费"] * 3, "明天交燃气费")
+        self.assertEqual(selected, "明天交水费")
+        self.assertEqual(result, "three_way_conflict")
+
+    def test_two_sensevoice_results_are_not_a_strong_consensus(self):
+        self.assertIsNone(sensevoice_consensus(["明天交水费", "明天交水费", ""]))
 
     def test_missing_playback_reference_never_claims_a_speaker_origin(self):
         scene = acoustic_scene_without_reference()
@@ -266,6 +290,24 @@ class ProcessorTests(unittest.TestCase):
             processor.qwen.transcribe.side_effect = lambda *args, **kwargs: __import__("time").sleep(1)
             with self.assertRaises(TranscriptionTimeout):
                 processor.qwen_transcribe(Path(directory) / "audio.wav")
+
+    def test_firered_adjudicator_is_isolated_and_parses_json(self):
+        with tempfile.TemporaryDirectory() as directory:
+            processor = self.make_processor(directory)
+            completed = mock.Mock(stdout='logs\n{"text":"原有","confidence":0.98}\n')
+            with mock.patch("processor.subprocess.run", return_value=completed) as run:
+                result = processor.firered_transcribe(Path(directory) / "speech.wav")
+            self.assertEqual(result["text"], "原有")
+            self.assertEqual(run.call_args.kwargs["timeout"], 45)
+            command = run.call_args.args[0]
+            self.assertIn("--audio", command)
+            self.assertIn("--model-dir", command)
+
+    def test_firered_timeout_falls_back_without_raising(self):
+        with tempfile.TemporaryDirectory() as directory:
+            processor = self.make_processor(directory)
+            with mock.patch("processor.subprocess.run", side_effect=subprocess.TimeoutExpired("firered", 45)):
+                self.assertIsNone(processor.firered_transcribe(Path(directory) / "speech.wav"))
 
     def test_processing_failure_is_preserved_without_expiry(self):
         with tempfile.TemporaryDirectory() as directory:
