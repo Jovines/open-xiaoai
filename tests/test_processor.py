@@ -8,6 +8,7 @@ from unittest import mock
 
 from processor import (
     apply_asr_adjudication,
+    asr_timeout_budget,
     asr_reliability,
     EventPostError,
     EvidenceProcessor,
@@ -50,7 +51,8 @@ class ProcessorTests(unittest.TestCase):
             firered_source_dir=root / "source",
             firered_deps_dir=root / "deps",
             firered_model_dir=root / "model",
-            firered_timeout_seconds=45,
+            firered_timeout_seconds=180,
+            asr_max_timeout_seconds=300,
         ))
 
     def test_agreement_ignores_spacing_and_punctuation(self):
@@ -81,6 +83,14 @@ class ProcessorTests(unittest.TestCase):
 
     def test_two_sensevoice_results_are_not_a_strong_consensus(self):
         self.assertIsNone(sensevoice_consensus(["明天交水费", "明天交水费", ""]))
+
+    def test_asr_timeout_scales_for_a_full_minute_of_speech(self):
+        with mock.patch("processor.audio_properties", return_value={"duration_seconds": 60}):
+            self.assertEqual(asr_timeout_budget(Path("speech.wav"), 180, 300), 210)
+
+    def test_asr_timeout_keeps_a_real_hang_ceiling(self):
+        with mock.patch("processor.audio_properties", return_value={"duration_seconds": 600}):
+            self.assertEqual(asr_timeout_budget(Path("speech.wav"), 180, 300), 300)
 
     def test_missing_playback_reference_never_claims_a_speaker_origin(self):
         scene = acoustic_scene_without_reference()
@@ -298,7 +308,7 @@ class ProcessorTests(unittest.TestCase):
             with mock.patch("processor.subprocess.run", return_value=completed) as run:
                 result = processor.firered_transcribe(Path(directory) / "speech.wav")
             self.assertEqual(result["text"], "原有")
-            self.assertEqual(run.call_args.kwargs["timeout"], 45)
+            self.assertEqual(run.call_args.kwargs["timeout"], 180)
             command = run.call_args.args[0]
             self.assertIn("--audio", command)
             self.assertIn("--model-dir", command)
@@ -306,7 +316,7 @@ class ProcessorTests(unittest.TestCase):
     def test_firered_timeout_falls_back_without_raising(self):
         with tempfile.TemporaryDirectory() as directory:
             processor = self.make_processor(directory)
-            with mock.patch("processor.subprocess.run", side_effect=subprocess.TimeoutExpired("firered", 45)):
+            with mock.patch("processor.subprocess.run", side_effect=subprocess.TimeoutExpired("firered", 180)):
                 self.assertIsNone(processor.firered_transcribe(Path(directory) / "speech.wav"))
 
     def test_processing_failure_is_preserved_without_expiry(self):

@@ -37,6 +37,10 @@ class EventPostError(RuntimeError):
 class TranscriptionTimeout(RuntimeError):
     """The primary ASR exceeded the per-recording CPU time budget."""
 
+    def __init__(self, message: str, *, timeout_seconds: float) -> None:
+        super().__init__(message)
+        self.timeout_seconds = timeout_seconds
+
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="筛掉无语音录音，并生成可回听、可审计的中文转写证据")
@@ -52,7 +56,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--sense-model", type=Path, default=Path(os.environ.get("SENSEVOICE_MODEL", str(Path.home() / "models/sensevoice-small/sensevoice-small-q8.gguf"))))
     parser.add_argument("--vad-model", type=Path, default=Path(os.environ.get("SENSEVOICE_VAD_MODEL", str(Path.home() / "models/sensevoice-small/fsmn-vad.gguf"))))
     parser.add_argument("--qwen-model", default=os.environ.get("QWEN_ASR_MODEL", "Qwen/Qwen3-ASR-1.7B"))
-    parser.add_argument("--qwen-timeout-seconds", type=float, default=float(os.environ.get("QWEN_ASR_TIMEOUT_SECONDS", "45")))
+    parser.add_argument("--qwen-timeout-seconds", type=float, default=float(os.environ.get("QWEN_ASR_TIMEOUT_SECONDS", "180")))
     parser.add_argument("--qwen-max-new-tokens", type=int, default=int(os.environ.get("QWEN_ASR_MAX_NEW_TOKENS", "384")))
     parser.add_argument("--firered-enabled", action=argparse.BooleanOptionalAction, default=os.environ.get("FIRERED_ASR_ENABLED", "0").lower() in {"1", "true", "yes", "on"})
     parser.add_argument("--firered-python", type=Path, default=Path(os.environ.get("FIRERED_ASR_PYTHON", sys.executable)))
@@ -60,7 +64,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--firered-source-dir", type=Path, default=Path(os.environ.get("FIRERED_ASR_SOURCE_DIR", str(Path.home() / ".local/opt/fireredasr2s"))))
     parser.add_argument("--firered-deps-dir", type=Path, default=Path(os.environ.get("FIRERED_ASR_DEPS_DIR", str(Path.home() / ".local/opt/fireredasr2-deps-py312"))))
     parser.add_argument("--firered-model-dir", type=Path, default=Path(os.environ.get("FIRERED_ASR_MODEL_DIR", str(Path.home() / "models/fireredasr2-aed"))))
-    parser.add_argument("--firered-timeout-seconds", type=float, default=float(os.environ.get("FIRERED_ASR_TIMEOUT_SECONDS", "45")))
+    parser.add_argument("--firered-timeout-seconds", type=float, default=float(os.environ.get("FIRERED_ASR_TIMEOUT_SECONDS", "180")))
+    parser.add_argument("--asr-max-timeout-seconds", type=float, default=float(os.environ.get("ASR_MAX_TIMEOUT_SECONDS", "300")))
     parser.add_argument("--diarization-python", type=Path, default=Path(os.environ.get("DIARIZATION_PYTHON", str(Path.home() / ".venvs/sherpa-onnx/bin/python"))))
     parser.add_argument("--diarization-script", type=Path, default=Path(os.environ.get("DIARIZATION_SCRIPT", str(Path(__file__).with_name("diarize.py")))))
     parser.add_argument("--diarization-segmentation", type=Path, default=Path(os.environ.get("DIARIZATION_SEGMENTATION_MODEL", str(Path.home() / "models/speaker-diarization/sherpa-onnx-pyannote-segmentation-3-0/model.onnx"))))
@@ -134,6 +139,17 @@ def apply_asr_adjudication(primary: str, alternatives: list[str], adjudicator_te
     if normalized_adjudicator == normalize_asr_text(primary):
         return primary, "primary_confirmed"
     return primary, "three_way_conflict"
+
+
+def asr_timeout_budget(audio: Path, minimum_seconds: float, maximum_seconds: float = 300) -> float:
+    """Allow long speech proportionally more CPU time while retaining a hang watchdog."""
+    minimum = max(0.01, minimum_seconds)
+    maximum = max(minimum, maximum_seconds)
+    try:
+        duration = float(audio_properties(audio)["duration_seconds"])
+    except (OSError, ValueError, KeyError, subprocess.SubprocessError, json.JSONDecodeError):
+        return minimum
+    return min(maximum, max(minimum, 30 + duration * 3))
 
 
 def acoustic_scene_without_reference() -> dict:
@@ -502,10 +518,10 @@ class EvidenceProcessor:
 
     def qwen_transcribe(self, audio: Path) -> str:
         self.load_qwen()
-        timeout = max(0.01, self.args.qwen_timeout_seconds)
+        timeout = asr_timeout_budget(audio, self.args.qwen_timeout_seconds, self.args.asr_max_timeout_seconds)
 
         def timed_out(signum, frame):
-            raise TranscriptionTimeout(f"Qwen 主转写超过 {timeout:g} 秒")
+            raise TranscriptionTimeout(f"Qwen 主转写超过动态预算 {timeout:g} 秒", timeout_seconds=timeout)
 
         previous_handler = signal.signal(signal.SIGALRM, timed_out)
         signal.setitimer(signal.ITIMER_REAL, timeout)
@@ -520,6 +536,7 @@ class EvidenceProcessor:
         """Run the memory-heavy model out of process so its RAM is reclaimed."""
         if not self.args.firered_enabled:
             return None
+        timeout = asr_timeout_budget(audio, self.args.firered_timeout_seconds, self.args.asr_max_timeout_seconds)
         try:
             result = subprocess.run([
                 str(self.args.firered_python), str(self.args.firered_script),
@@ -527,7 +544,7 @@ class EvidenceProcessor:
                 "--source-dir", str(self.args.firered_source_dir),
                 "--deps-dir", str(self.args.firered_deps_dir),
                 "--model-dir", str(self.args.firered_model_dir),
-            ], check=True, capture_output=True, text=True, timeout=self.args.firered_timeout_seconds)
+            ], check=True, capture_output=True, text=True, timeout=timeout)
             lines = [line for line in result.stdout.splitlines() if line.strip()]
             payload = json.loads(lines[-1])
             return payload if isinstance(payload, dict) else None
@@ -797,7 +814,7 @@ class EvidenceProcessor:
                     details={
                         "model": "Qwen3-ASR-1.7B",
                         "device": "cpu",
-                        "timeout_seconds": self.args.qwen_timeout_seconds,
+                        "timeout_seconds": error.timeout_seconds,
                         "selected_microphone": channel,
                         "speech_segments_ms": owned_segments,
                         "sensevoice_transcripts": texts,
