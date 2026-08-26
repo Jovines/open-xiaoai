@@ -1,0 +1,5 @@
+{"id":"live-chinese-001","audio":"acoustic-scenes/live-chinese-001.flac","sha256":"填写64位SHA256","label":"live_conversation","day":"YYYY-MM-DD","speaker":"anonymous-a","device":"none","transcript":"可选，仅用于语言与轮次特征"}
+{"id":"live-english-reading-001","audio":"acoustic-scenes/live-english-reading-001.flac","sha256":"填写64位SHA256","label":"live_monologue_or_reading","day":"YYYY-MM-DD","speaker":"anonymous-a","device":"none","transcript":"optional English transcript"}
+{"id":"duolingo-phone-001","audio":"acoustic-scenes/duolingo-phone-001.flac","sha256":"填写64位SHA256","label":"phone_language_learning_playback","day":"YYYY-MM-DD","speaker":"none","device":"phone-a","transcript":"optional"}
+{"id":"phone-video-001","audio":"acoustic-scenes/phone-video-001.flac","sha256":"填写64位SHA256","label":"phone_or_computer_media_playback","day":"YYYY-MM-DD","speaker":"none","device":"phone-a","transcript":"optional"}
+{"id":"television-001","audio":"acoustic-scenes/television-001.flac","sha256":"填写64位SHA256","label":"television_or_remote_media","day":"YYYY-MM-DD","speaker":"none","device":"tv-a","transcript":"optional"}

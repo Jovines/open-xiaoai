@@ -48,3 +48,16 @@ CUDA_VISIBLE_DEVICES='' ~/.venvs/qwen3-asr/bin/python -m evaluation.asr_benchmar
 FireRedASR2-AED FP32 CPU 单独批测四条时整体 micro-CER 为 1.39%、关键短语准确率 87.5%、推理 RTF 0.72；三个房间样本全部正确，数字 reference 把“原有”错成“人有”。它对生产同形态的 6.67 秒 VAD 单声道样本冷启动 5.9 秒、推理 4.9 秒、峰值内存约 9.6 GB。生产据此采用“强冲突时隔离进程按需仲裁”，而不是把第三个大模型常驻。GLM-ASR-Nano 等候选继续留在扩展评测池；在现有四条小样本不足以证明增益前，不再引入另一套大运行时。样本太少，以上结果只证明当前分工合理，不代表通用模型排名。
 
 增益对照中，房间语音满幅削波比例从 `×256` 的 1.581973% 降至 `×128` 的 0.062687%，最终 `×96` 为 0.002811%；模型的房间样本 CER 未因降增益退化。生产因此采用 `×96`。初始机器报告保存在 NAS `录音/evaluation/results/controlled-gain96.json`。
+
+## 声学场景评测
+
+复制 `evaluation/acoustic-scenes.example.jsonl` 到 NAS 后，用人工听审填写真实标签与 SHA256。训练集、验证集和测试集必须按日期与说话人分开，不能让同一段外放内容或同一个人的相邻录音跨集合泄漏。
+
+```bash
+CUDA_VISIBLE_DEVICES='' ~/.venvs/qwen3-asr/bin/python evaluation/scene_benchmark.py \
+  --manifest /mnt/dx4600/家庭管家/录音/evaluation/acoustic-scenes.test.jsonl \
+  --audio-root /mnt/dx4600/家庭管家/录音/evaluation \
+  --output /mnt/dx4600/家庭管家/录音/evaluation/results/acoustic-scenes.test.json
+```
+
+报告包含整体 accuracy、macro-F1、逐类 precision/recall/F1、unknown 拒识、10 桶 ECE、混淆矩阵，以及按日期、说话人和播放设备切片的完整指标。当前规则融合只允许输出 `candidate`；在家庭测试集达到门禁前，不得根据语言学习候选断言具体手机应用，也不得根据声纹候选输出姓名。
