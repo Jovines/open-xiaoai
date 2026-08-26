@@ -92,7 +92,37 @@ def resolve_audio(case: dict, audio_root: Path) -> Path:
     return path
 
 
-def prepare_audio(case: dict, source: Path, destination: Path) -> None:
+def prepare_audio(case: dict, source: Path, destination: Path) -> dict:
+    preprocessing = str(case.get("preprocessing") or "ffmpeg_mono")
+    raw_segments = case.get("segments_ms")
+    if preprocessing in {"oh2p_array_enhanced", "oh2p_channel"}:
+        if not isinstance(raw_segments, list) or not raw_segments:
+            raise ValueError(f"{case['id']} array/channel preprocessing requires segments_ms")
+        try:
+            segments = [(int(item[0]), int(item[1])) for item in raw_segments]
+        except (TypeError, ValueError, IndexError) as error:
+            raise ValueError(f"{case['id']} has invalid segments_ms") from error
+        if any(start < 0 or end <= start for start, end in segments):
+            raise ValueError(f"{case['id']} has invalid segments_ms")
+        from processor import extract_microphones, extract_speech_audio
+        microphones = extract_microphones(source, destination.parent / f"{case['id']}-microphones")
+        if preprocessing == "oh2p_channel":
+            channel = int(case.get("channel", -1))
+            if channel not in range(len(microphones)):
+                raise ValueError(f"{case['id']} requires channel 0..{len(microphones) - 1}")
+            extract_speech_audio(microphones[channel], destination, segments)
+            return {"mode": preprocessing, "channel": channel, "segments_ms": segments}
+        from array_enhancement import enhance_speech_audio
+        enhancement = enhance_speech_audio(
+            microphones,
+            destination,
+            segments,
+            max_delay_ms=float(case.get("max_delay_ms", 2.0)),
+            min_coherence=float(case.get("min_coherence", 0.15)),
+            reference_weight=float(case.get("reference_weight", 0.7)),
+        )
+        return {"mode": preprocessing, **enhancement}
+
     command = ["ffmpeg", "-v", "error", "-y"]
     if "start_seconds" in case:
         command.extend(["-ss", str(float(case["start_seconds"]))])
@@ -103,6 +133,7 @@ def prepare_audio(case: dict, source: Path, destination: Path) -> None:
         command.extend(["-map_channel", f"0.0.{int(case['channel'])}"])
     command.extend(["-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", str(destination)])
     subprocess.run(command, check=True)
+    return {"mode": preprocessing}
 
 
 def wav_quality(path: Path) -> dict[str, float | int]:
@@ -321,9 +352,9 @@ def main() -> int:
         prepared = {}
         for case in cases:
             destination = Path(directory) / f"{case['id']}.wav"
-            prepare_audio(case, resolve_audio(case, args.audio_root), destination)
+            preprocessing = prepare_audio(case, resolve_audio(case, args.audio_root), destination)
             prepared[case["id"]] = destination
-            qualities[case["id"]] = wav_quality(destination)
+            qualities[case["id"]] = {**wav_quality(destination), "preprocessing": preprocessing}
         for engine in engines:
             results = []
             for repeat in range(1, args.repeat + 1):

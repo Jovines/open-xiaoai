@@ -62,6 +62,16 @@ class ManifestTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "哈希不符"):
                 asr_benchmark.resolve_audio({"audio": "sample.wav", "sha256": "0" * 64}, root)
 
+    def test_array_preprocessing_requires_explicit_auditable_segments(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with self.assertRaisesRegex(ValueError, "requires segments_ms"):
+                asr_benchmark.prepare_audio(
+                    {"id": "array", "preprocessing": "oh2p_array_enhanced"},
+                    root / "raw.flac",
+                    root / "prepared.wav",
+                )
+
 
 class EngineTests(unittest.TestCase):
     def test_funasr_nano_uses_separate_encoder_llm_and_vad(self):
