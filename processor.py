@@ -21,6 +21,9 @@ import time
 import urllib.error
 import urllib.request
 
+from scene_analysis import array_spatial_features, infer_scene
+from speaker_profiles import SpeakerProfileStore
+
 
 FILENAME_TIME = re.compile(r"^(\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}_[+-]\d{4})")
 SUPPORTED_AUDIO = {".flac", ".wav", ".ogg"}
@@ -70,6 +73,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--diarization-script", type=Path, default=Path(os.environ.get("DIARIZATION_SCRIPT", str(Path(__file__).with_name("diarize.py")))))
     parser.add_argument("--diarization-segmentation", type=Path, default=Path(os.environ.get("DIARIZATION_SEGMENTATION_MODEL", str(Path.home() / "models/speaker-diarization/sherpa-onnx-pyannote-segmentation-3-0/model.onnx"))))
     parser.add_argument("--diarization-embedding", type=Path, default=Path(os.environ.get("DIARIZATION_EMBEDDING_MODEL", str(Path.home() / "models/speaker-diarization/3dspeaker-zh.onnx"))))
+    parser.add_argument("--speaker-profiles-enabled", action=argparse.BooleanOptionalAction, default=os.environ.get("SPEAKER_PROFILES_ENABLED", "1").lower() in {"1", "true", "yes", "on"})
+    parser.add_argument("--speaker-profiles-file", type=Path, default=Path(os.environ.get("SPEAKER_PROFILES_FILE", str(Path.home() / ".local/share/open-xiaoai/speaker-profiles.json"))))
+    parser.add_argument("--speaker-profile-threshold", type=float, default=float(os.environ.get("SPEAKER_PROFILE_THRESHOLD", "0.82")))
+    parser.add_argument("--audio-tagging-enabled", action=argparse.BooleanOptionalAction, default=os.environ.get("AUDIO_TAGGING_ENABLED", "1").lower() in {"1", "true", "yes", "on"})
+    parser.add_argument("--audio-tagging-python", type=Path, default=Path(os.environ.get("AUDIO_TAGGING_PYTHON", str(Path.home() / ".venvs/sherpa-onnx/bin/python"))))
+    parser.add_argument("--audio-tagging-script", type=Path, default=Path(os.environ.get("AUDIO_TAGGING_SCRIPT", str(Path(__file__).with_name("audio_tag.py")))))
+    parser.add_argument("--audio-tagging-model", type=Path, default=Path(os.environ.get("AUDIO_TAGGING_MODEL", str(Path.home() / "models/audio-tagging/sherpa-onnx-ced-mini-audio-tagging-2024-04-19/model.int8.onnx"))))
+    parser.add_argument("--audio-tagging-labels", type=Path, default=Path(os.environ.get("AUDIO_TAGGING_LABELS", str(Path.home() / "models/audio-tagging/sherpa-onnx-ced-mini-audio-tagging-2024-04-19/class_labels_indices.csv"))))
     parser.add_argument("--zeris-url", default=os.environ.get("ZERIS_AUDIO_INGEST_URL", ""))
     parser.add_argument("--zeris-token", default=os.environ.get("ZERIS_AUDIO_INGEST_TOKEN", ""))
     parser.add_argument("--poll-seconds", type=float, default=float(os.environ.get("PROCESSOR_POLL_SECONDS", "3")))
@@ -472,6 +483,10 @@ class EvidenceProcessor:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
         self.qwen = None
+        self.speaker_profiles = SpeakerProfileStore(
+            getattr(args, "speaker_profiles_file", Path.home() / ".local/share/open-xiaoai/speaker-profiles.json"),
+            threshold=getattr(args, "speaker_profile_threshold", 0.82),
+        )
         self.pending_retry_attempts: dict[Path, int] = {}
         self.pending_retry_after: dict[Path, float] = {}
 
@@ -552,7 +567,32 @@ class EvidenceProcessor:
             logging.warning("FireRed 按需仲裁失败，保留 Qwen 主结果和 SenseVoice 候选：%s", error)
             return None
 
-    def diarize(self, audio: Path) -> tuple[list[dict], str]:
+    def audio_tag(self, audio: Path) -> dict | None:
+        if not getattr(self.args, "audio_tagging_enabled", False):
+            return None
+        required = (
+            getattr(self.args, "audio_tagging_python", Path("")),
+            getattr(self.args, "audio_tagging_script", Path("")),
+            getattr(self.args, "audio_tagging_model", Path("")),
+            getattr(self.args, "audio_tagging_labels", Path("")),
+        )
+        if not all(path.is_file() for path in required):
+            return None
+        try:
+            result = subprocess.run([
+                str(self.args.audio_tagging_python), str(self.args.audio_tagging_script), str(audio),
+                "--model", str(self.args.audio_tagging_model),
+                "--labels", str(self.args.audio_tagging_labels),
+                "--top-k", "8",
+            ], check=True, capture_output=True, text=True, timeout=60)
+            lines = [line for line in result.stdout.splitlines() if line.strip()]
+            payload = json.loads(lines[-1])
+            return payload if isinstance(payload, dict) and isinstance(payload.get("tags"), list) else None
+        except (subprocess.SubprocessError, OSError, ValueError, json.JSONDecodeError) as error:
+            logging.warning("声学场景粗分类失败但不阻断原音与转写：%s", error)
+            return None
+
+    def diarize(self, audio: Path, embedding_intervals: list[tuple[float, float]] | None = None) -> tuple[list[dict], list[dict], str]:
         required = (
             self.args.diarization_python,
             self.args.diarization_script,
@@ -560,25 +600,28 @@ class EvidenceProcessor:
             self.args.diarization_embedding,
         )
         if not all(path.is_file() for path in required):
-            return [], "models_unavailable"
+            return [], [], "models_unavailable"
         try:
             result = subprocess.run([
                 str(self.args.diarization_python), str(self.args.diarization_script), str(audio),
                 "--segmentation", str(self.args.diarization_segmentation),
                 "--embedding", str(self.args.diarization_embedding),
+                "--embedding-intervals-json", json.dumps(embedding_intervals or []),
             ], check=True, capture_output=True, text=True, timeout=180)
             raw = json.loads(result.stdout)
+            raw_segments = raw.get("segments", []) if isinstance(raw, dict) else raw
+            raw_embeddings = raw.get("speaker_embeddings", []) if isinstance(raw, dict) else []
             speakers = [{
                 "speaker_id": f"recording-speaker-{int(item['speaker']):02d}",
                 "label": None,
                 "start_seconds": float(item["start_seconds"]),
                 "end_seconds": float(item["end_seconds"]),
                 "confidence": None,
-            } for item in raw]
-            return speakers, "anonymous_recording_clusters"
+            } for item in raw_segments]
+            return speakers, raw_embeddings, "anonymous_recording_clusters_with_embeddings"
         except (subprocess.SubprocessError, OSError, ValueError, KeyError, json.JSONDecodeError) as error:
             logging.warning("说话人分离失败但不阻断原音与转写：%s", error)
-            return [], "failed"
+            return [], [], "failed"
 
     def pending_files(self) -> list[Path]:
         cutoff = time.time() - self.args.settle_seconds
@@ -852,7 +895,10 @@ class EvidenceProcessor:
                 firered.get("text") if firered else None,
             )
 
-            speakers, diarization_status = self.diarize(microphones[channel])
+            speakers, speaker_embeddings, diarization_status = self.diarize(
+                microphones[channel],
+                [(start / 1000, end / 1000) for start, end in owned_segments],
+            )
             event_start_ms = min(start for start, _ in owned_segments)
             event_end_ms = max(end for _, end in owned_segments)
             filtered_speakers = []
@@ -908,6 +954,35 @@ class EvidenceProcessor:
                 speech_segments_seconds,
                 playback_matches,
             )
+            audio_tagging = self.audio_tag(speech_microphones[channel])
+            try:
+                spatial_features = array_spatial_features(speech_microphones)
+            except (OSError, ValueError, RuntimeError) as error:
+                logging.warning("三麦空间特征计算失败但不阻断证据：%s", error)
+                spatial_features = {"status": "failed"}
+            scene = infer_scene(acoustic_scene, audio_tagging, selected_transcript, spatial_features)
+            profile_assignments = {}
+            if getattr(self.args, "speaker_profiles_enabled", False):
+                try:
+                    profile_assignments = self.speaker_profiles.assign(
+                        event_id=f"audio-{identity[:24]}",
+                        samples=speaker_embeddings,
+                        speaker_segments=filtered_speakers,
+                        playback_intervals=[(item["event_start_seconds"], item["event_end_seconds"]) for item in playback_matches],
+                        scene=scene,
+                        audio_refs=refs,
+                    )
+                except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as error:
+                    logging.warning("长期匿名说话人档案更新失败但不阻断证据：%s", error)
+            filtered_speakers = [
+                {**speaker, **profile_assignments.get(speaker["speaker_id"], {
+                    "profile_id": None,
+                    "similarity": None,
+                    "identity_label": None,
+                    "identity_status": "profile_unavailable",
+                })}
+                for speaker in filtered_speakers
+            ]
 
             reliability = asr_reliability(primary, texts)
             if adjudication_result == "sensevoice_consensus_confirmed":
@@ -938,6 +1013,7 @@ class EvidenceProcessor:
                 "alternatives": alternatives,
                 "speakers": filtered_speakers,
                 "acoustic_scene": acoustic_scene,
+                "scene": scene,
                 "reliability": reliability,
                 "provenance": {
                     "schema_version": 1,
@@ -978,8 +1054,17 @@ class EvidenceProcessor:
                     "speaker_diarization": {
                         "status": diarization_status,
                         "engine": "sherpa-onnx/pyannote-segmentation-3.0/3D-Speaker-zh",
-                        "cluster_scope": "recording_only",
+                        "cluster_scope": "recording_plus_persistent_anonymous_candidates",
                         "identity_claims_allowed": False,
+                        "profile_store": "local_private_not_transmitted",
+                        "profile_threshold": getattr(self.args, "speaker_profile_threshold", 0.82),
+                    },
+                    "acoustic_scene_analysis": {
+                        "mode": scene["mode"],
+                        "primary": scene["primary"],
+                        "audio_tagging": audio_tagging,
+                        "spatial_features": spatial_features,
+                        "custom_household_classifier": "awaiting_labeled_household_samples",
                     },
                 },
             }
@@ -1005,7 +1090,7 @@ class EvidenceProcessor:
             if self.args.zeris_url:
                 pending.replace(evidence_audio.with_suffix(evidence_audio.suffix + ".event.json"))
                 self.finish_pending(pending)
-            logging.info("已保留跨边界语音证据：%s（%d 个 VAD 区间，模型一致度 %.3f）", evidence_audio, len(owned_segments), score)
+            logging.info("已保留跨边界语音证据：%s（%d 个 VAD 区间，模型一致度 %.3f）", evidence_audio, len(owned_segments), reliability["score"])
             return "evidence"
 
     def retry_pending_events(self) -> int:
