@@ -18,6 +18,8 @@
 
 OH2P 声卡拓扑、原厂进程边界、播放 fan-out 协议、内核兼容踩坑、验收与回滚门禁统一记录在 [`docs/oh2p-audio-integration.md`](docs/oh2p-audio-integration.md)。经验文档是后续实现的依据，不能只留在聊天记录里。
 
+声学场景、手机/多邻国外放、长期匿名声纹、人工命名和低风险家庭认知候选的模型选型与上线门禁，见 [`docs/acoustic-scene-and-speaker-identity.md`](docs/acoustic-scene-and-speaker-identity.md)。
+
 中文 ASR 的可复现清单、micro-CER、关键短语、稳定性、CPU RTF 与削波评测见 [`evaluation/README.md`](evaluation/README.md)。音频与机器报告保存在 NAS，Git 只保存无隐私标签、哈希和运行代码。
 
 ## 实测基线
