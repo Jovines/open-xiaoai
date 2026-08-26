@@ -3,11 +3,14 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+import wave
 from types import SimpleNamespace
 from unittest import mock
 
+import numpy as np
+
+from array_enhancement import enhance_speech_audio, fuse_vad_segments, gcc_phat_delay
 from processor import (
-    apply_asr_adjudication,
     asr_timeout_budget,
     asr_reliability,
     EventPostError,
@@ -18,16 +21,12 @@ from processor import (
     atomic_json,
     audio_properties,
     audio_refs_for_segments,
-    choose_microphone,
-    choose_microphone_result,
     concatenate_audio,
     extract_speech_audio,
     merge_vad_segments,
-    normalized_agreement,
     owned_vad_segments,
     parse_capture_time,
     playback_matches_for_window,
-    sensevoice_consensus,
     vad_segments,
 )
 
@@ -45,44 +44,23 @@ class ProcessorTests(unittest.TestCase):
             zeris_token="test",
             qwen_timeout_seconds=0.02,
             qwen_max_new_tokens=384,
-            firered_enabled=True,
-            firered_python=root / "python",
-            firered_script=root / "firered_transcribe.py",
-            firered_source_dir=root / "source",
-            firered_deps_dir=root / "deps",
-            firered_model_dir=root / "model",
-            firered_timeout_seconds=180,
+            array_min_vad_channels=2,
+            array_max_delay_ms=2.0,
+            array_min_coherence=0.15,
+            array_reference_weight=0.70,
             asr_max_timeout_seconds=300,
         ))
 
-    def test_agreement_ignores_spacing_and_punctuation(self):
-        self.assertEqual(normalized_agreement("明天，交水费。", "明天交水费"), 1.0)
-
-    def test_one_character_model_conflict_requires_review(self):
-        result = asr_reliability("小爱仍有功能", ["小爱原有功能"] * 3)
+    def test_good_array_signal_is_usable_without_claiming_high_asr_agreement(self):
+        result = asr_reliability("明天交水费", {"quality_score": 0.72, "fallback_fraction": 0.0})
         self.assertEqual(result["agreement"], "medium")
-        self.assertTrue(result["needs_review"])
-
-    def test_exact_three_microphone_consensus_is_high_but_not_infallible(self):
-        result = asr_reliability("明天交水费", ["明天，交水费。"] * 3)
-        self.assertEqual(result["agreement"], "high")
         self.assertFalse(result["needs_review"])
-        self.assertIn("仍可能听错", result["notes"])
+        self.assertIn("低风险理解", result["notes"])
 
-    def test_fire_red_can_confirm_three_microphone_consensus(self):
-        alternatives = ["小爱原有功能"] * 3
-        self.assertEqual(sensevoice_consensus(alternatives), "小爱原有功能")
-        selected, result = apply_asr_adjudication("小爱仍有功能", alternatives, "小爱原有功能")
-        self.assertEqual(selected, "小爱原有功能")
-        self.assertEqual(result, "sensevoice_consensus_confirmed")
-
-    def test_fire_red_disagreement_never_silently_rewrites_primary(self):
-        selected, result = apply_asr_adjudication("明天交水费", ["明天交电费"] * 3, "明天交燃气费")
-        self.assertEqual(selected, "明天交水费")
-        self.assertEqual(result, "three_way_conflict")
-
-    def test_two_sensevoice_results_are_not_a_strong_consensus(self):
-        self.assertIsNone(sensevoice_consensus(["明天交水费", "明天交水费", ""]))
+    def test_array_fallback_stays_reviewable(self):
+        result = asr_reliability("明天交水费", {"quality_score": 0.7, "fallback_fraction": 1.0})
+        self.assertEqual(result["agreement"], "low")
+        self.assertTrue(result["needs_review"])
 
     def test_asr_timeout_scales_for_a_full_minute_of_speech(self):
         with mock.patch("processor.audio_properties", return_value={"duration_seconds": 60}):
@@ -140,12 +118,6 @@ class ProcessorTests(unittest.TestCase):
         self.assertNotIn("overlap", origins)
         self.assertTrue(scene["needs_review"])
 
-    def test_microphone_medoid_rejects_outlier(self):
-        self.assertEqual(choose_microphone(["明天交水费", "明天记得交水费", "今天去浇花"]), 0)
-
-    def test_microphone_result_falls_back_to_strongest_vad_channel(self):
-        self.assertEqual(choose_microphone_result([(1, "So."), (4, ""), (2, "")]), 1)
-
     def test_capture_time_uses_embedded_timezone(self):
         value = parse_capture_time(Path("2026-08-25_08-30-00_+0800.flac"))
         self.assertEqual(value.utcoffset(), dt.timedelta(hours=8))
@@ -184,6 +156,56 @@ class ProcessorTests(unittest.TestCase):
 
     def test_vad_padding_merges_overlapping_intervals(self):
         self.assertEqual(merge_vad_segments([(100, 500), (600, 900), (2000, 2100)]), [(0, 1100), (1800, 2300)])
+
+    def test_vad_fusion_requires_two_distinct_microphones(self):
+        channels = [
+            [(100, 600), (500, 800)],
+            [(200, 700)],
+            [(1200, 1500)],
+        ]
+        self.assertEqual(fuse_vad_segments(channels, min_channels=2), [(200, 700)])
+
+    def test_gcc_phat_reports_positive_delay_for_later_microphone(self):
+        rng = np.random.default_rng(7)
+        reference = rng.normal(0, 0.1, 4096).astype(np.float32)
+        signal = np.concatenate((np.zeros(5, dtype=np.float32), reference[:-5]))
+        delay, coherence = gcc_phat_delay(reference, signal, max_delay_samples=16)
+        self.assertAlmostEqual(delay, 5, delta=0.6)
+        self.assertGreater(coherence, 0.95)
+
+    @staticmethod
+    def write_wave(path: Path, samples: np.ndarray, sample_rate: int = 16000) -> None:
+        encoded = np.rint(np.clip(samples, -0.98, 0.98) * 32767).astype("<i2")
+        with wave.open(str(path), "wb") as destination:
+            destination.setnchannels(1)
+            destination.setsampwidth(2)
+            destination.setframerate(sample_rate)
+            destination.writeframes(encoded.tobytes())
+
+    def test_array_enhancement_aligns_good_channels_and_rejects_noise_outlier(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            rng = np.random.default_rng(11)
+            excitation = rng.normal(0, 0.12, 16000).astype(np.float32)
+            base = np.convolve(excitation, np.ones(7, dtype=np.float32) / 7, mode="same")
+            mic0 = base + rng.normal(0, 0.01, base.size)
+            mic1 = np.concatenate((np.zeros(4), base[:-4])) + rng.normal(0, 0.01, base.size)
+            mic2 = rng.normal(0, 0.25, base.size)
+            microphones = []
+            for index, samples in enumerate((mic0, mic1, mic2)):
+                path = root / f"mic-{index}.wav"
+                self.write_wave(path, samples)
+                microphones.append(path)
+            output = root / "enhanced.wav"
+            metadata = enhance_speech_audio(microphones, output, [(0, 1000)])
+            detail = metadata["segments"][0]
+            self.assertEqual(detail["mode"], "reference_preserving_delay_and_sum")
+            self.assertLess(detail["weights"][2], 0.05)
+            self.assertGreaterEqual(detail["weights"][metadata["reference_channel"]], 0.7)
+            self.assertGreater(metadata["quality_score"], 0.3)
+            with wave.open(str(output), "rb") as enhanced:
+                samples = np.frombuffer(enhanced.readframes(enhanced.getnframes()), dtype="<i2")
+            self.assertLessEqual(int(np.max(np.abs(samples))), round(32767 * 0.98))
 
     def test_speech_extraction_removes_long_silence(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -230,41 +252,6 @@ class ProcessorTests(unittest.TestCase):
             self.assertEqual(refs[1]["offset_end_seconds"], 2.0)
             self.assertRegex(refs[0]["sha256"], r"^[a-f0-9]{64}$")
 
-    def test_empty_primary_with_one_active_channel_is_noise_false_positive(self):
-        event = {
-            "transcript": "",
-            "provenance": {"cross_check": {"all_microphone_transcripts": ["So.", "", ""]}},
-        }
-        self.assertTrue(EvidenceProcessor.is_single_channel_false_positive(event))
-        event["transcript"] = "明天交水费"
-        self.assertFalse(EvidenceProcessor.is_single_channel_false_positive(event))
-
-    def test_retry_quarantines_known_false_positive_then_sends_next_event(self):
-        with tempfile.TemporaryDirectory() as directory:
-            processor = self.make_processor(directory)
-            day = processor.args.evidence_dir / "2026/08/25"
-            day.mkdir(parents=True)
-            noisy_audio = day / "2026-08-25_01-12-11_+0800.flac"
-            noisy_audio.write_bytes(b"fan-noise")
-            noisy_pending = noisy_audio.with_suffix(".flac.event.pending.json")
-            atomic_json(noisy_pending, {
-                "transcript": "",
-                "provenance": {"cross_check": {"all_microphone_transcripts": ["So.", "", ""]}},
-            })
-            speech_audio = day / "2026-08-25_01-13-11_+0800.flac"
-            speech_audio.write_bytes(b"speech")
-            speech_pending = speech_audio.with_suffix(".flac.event.pending.json")
-            atomic_json(speech_pending, {"transcript": "明天交水费"})
-
-            with mock.patch.object(processor, "post_event") as post_event:
-                self.assertEqual(processor.retry_pending_events(), 1)
-
-            post_event.assert_called_once_with({"transcript": "明天交水费"})
-            self.assertFalse(noisy_audio.exists())
-            self.assertFalse(noisy_pending.exists())
-            self.assertTrue((processor.args.discard_dir / "2026/08/25/2026-08-25_01-12-11_+0800.flac.quarantine").is_file())
-            self.assertTrue(speech_audio.with_suffix(".flac.event.json").is_file())
-
     def test_retryable_failure_does_not_block_later_pending_event(self):
         with tempfile.TemporaryDirectory() as directory:
             processor = self.make_processor(directory)
@@ -300,24 +287,6 @@ class ProcessorTests(unittest.TestCase):
             processor.qwen.transcribe.side_effect = lambda *args, **kwargs: __import__("time").sleep(1)
             with self.assertRaises(TranscriptionTimeout):
                 processor.qwen_transcribe(Path(directory) / "audio.wav")
-
-    def test_firered_adjudicator_is_isolated_and_parses_json(self):
-        with tempfile.TemporaryDirectory() as directory:
-            processor = self.make_processor(directory)
-            completed = mock.Mock(stdout='logs\n{"text":"原有","confidence":0.98}\n')
-            with mock.patch("processor.subprocess.run", return_value=completed) as run:
-                result = processor.firered_transcribe(Path(directory) / "speech.wav")
-            self.assertEqual(result["text"], "原有")
-            self.assertEqual(run.call_args.kwargs["timeout"], 180)
-            command = run.call_args.args[0]
-            self.assertIn("--audio", command)
-            self.assertIn("--model-dir", command)
-
-    def test_firered_timeout_falls_back_without_raising(self):
-        with tempfile.TemporaryDirectory() as directory:
-            processor = self.make_processor(directory)
-            with mock.patch("processor.subprocess.run", side_effect=subprocess.TimeoutExpired("firered", 180)):
-                self.assertIsNone(processor.firered_transcribe(Path(directory) / "speech.wav"))
 
     def test_processing_failure_is_preserved_without_expiry(self):
         with tempfile.TemporaryDirectory() as directory:

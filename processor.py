@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
-import difflib
 import hashlib
 import json
 import logging
@@ -15,12 +14,12 @@ import re
 import signal
 import shutil
 import subprocess
-import sys
 import tempfile
 import time
 import urllib.error
 import urllib.request
 
+from array_enhancement import enhance_speech_audio, fuse_vad_segments
 from scene_analysis import array_spatial_features, infer_scene
 from speaker_profiles import SpeakerProfileStore
 
@@ -54,20 +53,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--nas-uri-root", default=os.environ.get("PROCESSOR_NAS_URI_ROOT", "nas://dx4600/家庭管家/录音/evidence"))
     parser.add_argument("--playback-dir", type=Path, default=Path(os.environ.get("PROCESSOR_PLAYBACK_DIR", "/mnt/dx4600/家庭管家/录音/playback")))
     parser.add_argument("--playback-nas-uri-root", default=os.environ.get("PROCESSOR_PLAYBACK_NAS_URI_ROOT", "nas://dx4600/家庭管家/录音/playback"))
-    parser.add_argument("--sense-binary", type=Path, default=Path(os.environ.get("SENSEVOICE_BINARY", str(Path.home() / ".local/opt/sensevoice/llama-funasr-sensevoice"))))
     parser.add_argument("--vad-binary", type=Path, default=Path(os.environ.get("FSMN_VAD_BINARY", str(Path.home() / ".local/opt/sensevoice/llama-funasr-vad"))))
-    parser.add_argument("--sense-model", type=Path, default=Path(os.environ.get("SENSEVOICE_MODEL", str(Path.home() / "models/sensevoice-small/sensevoice-small-q8.gguf"))))
     parser.add_argument("--vad-model", type=Path, default=Path(os.environ.get("SENSEVOICE_VAD_MODEL", str(Path.home() / "models/sensevoice-small/fsmn-vad.gguf"))))
+    parser.add_argument("--array-min-vad-channels", type=int, choices=(1, 2, 3), default=int(os.environ.get("ARRAY_MIN_VAD_CHANNELS", "2")))
+    parser.add_argument("--array-max-delay-ms", type=float, default=float(os.environ.get("ARRAY_MAX_DELAY_MS", "2.0")))
+    parser.add_argument("--array-min-coherence", type=float, default=float(os.environ.get("ARRAY_MIN_COHERENCE", "0.15")))
+    parser.add_argument("--array-reference-weight", type=float, default=float(os.environ.get("ARRAY_REFERENCE_WEIGHT", "0.70")))
     parser.add_argument("--qwen-model", default=os.environ.get("QWEN_ASR_MODEL", "Qwen/Qwen3-ASR-1.7B"))
     parser.add_argument("--qwen-timeout-seconds", type=float, default=float(os.environ.get("QWEN_ASR_TIMEOUT_SECONDS", "180")))
     parser.add_argument("--qwen-max-new-tokens", type=int, default=int(os.environ.get("QWEN_ASR_MAX_NEW_TOKENS", "384")))
-    parser.add_argument("--firered-enabled", action=argparse.BooleanOptionalAction, default=os.environ.get("FIRERED_ASR_ENABLED", "0").lower() in {"1", "true", "yes", "on"})
-    parser.add_argument("--firered-python", type=Path, default=Path(os.environ.get("FIRERED_ASR_PYTHON", sys.executable)))
-    parser.add_argument("--firered-script", type=Path, default=Path(os.environ.get("FIRERED_ASR_SCRIPT", str(Path(__file__).parent / "scripts/firered_transcribe.py"))))
-    parser.add_argument("--firered-source-dir", type=Path, default=Path(os.environ.get("FIRERED_ASR_SOURCE_DIR", str(Path.home() / ".local/opt/fireredasr2s"))))
-    parser.add_argument("--firered-deps-dir", type=Path, default=Path(os.environ.get("FIRERED_ASR_DEPS_DIR", str(Path.home() / ".local/opt/fireredasr2-deps-py312"))))
-    parser.add_argument("--firered-model-dir", type=Path, default=Path(os.environ.get("FIRERED_ASR_MODEL_DIR", str(Path.home() / "models/fireredasr2-aed"))))
-    parser.add_argument("--firered-timeout-seconds", type=float, default=float(os.environ.get("FIRERED_ASR_TIMEOUT_SECONDS", "180")))
     parser.add_argument("--asr-max-timeout-seconds", type=float, default=float(os.environ.get("ASR_MAX_TIMEOUT_SECONDS", "300")))
     parser.add_argument("--diarization-python", type=Path, default=Path(os.environ.get("DIARIZATION_PYTHON", str(Path.home() / ".venvs/sherpa-onnx/bin/python"))))
     parser.add_argument("--diarization-script", type=Path, default=Path(os.environ.get("DIARIZATION_SCRIPT", str(Path(__file__).with_name("diarize.py")))))
@@ -97,59 +91,31 @@ def normalize_asr_text(value: str) -> str:
     return re.sub(r"[\W_]+", "", value, flags=re.UNICODE).lower()
 
 
-def normalized_agreement(left: str, right: str) -> float:
-    a, b = normalize_asr_text(left), normalize_asr_text(right)
-    if not a or not b:
-        return 0.0
-    return difflib.SequenceMatcher(None, a, b).ratio()
+def asr_reliability(primary: str, enhancement: dict) -> dict:
+    """Describe one-pass ASR usability without pretending to know word accuracy.
 
-
-def asr_reliability(primary: str, alternatives: list[str]) -> dict:
-    """Do not let a high fuzzy score hide a potentially critical word conflict."""
-    active = [text for text in alternatives if normalize_asr_text(text)]
-    comparisons = [normalized_agreement(primary, text) for text in active]
-    score = sum(comparisons) / len(comparisons) if comparisons else 0.0
-    exact_consensus = len(active) == 3 and all(normalize_asr_text(primary) == normalize_asr_text(text) for text in active)
-    if exact_consensus:
-        agreement = "high"
-    elif score >= 0.65:
-        agreement = "medium"
-    else:
-        agreement = "low"
+    Array coherence is a signal-quality indicator.  It makes ordinary household
+    observations usable, while the permanent ``fallible_asr`` contract still
+    requires source verification before high-impact action.
+    """
+    score = float(enhancement.get("quality_score", 0.0) or 0.0)
+    fallback_fraction = float(enhancement.get("fallback_fraction", 1.0) or 0.0)
+    usable = bool(normalize_asr_text(primary)) and score >= 0.15 and fallback_fraction < 0.5
     return {
-        "agreement": agreement,
-        "score": round(score, 4),
-        "needs_review": not exact_consensus,
+        # The ingest contract calls this field agreement.  With single-pass ASR,
+        # medium means usable acoustic evidence, never multi-model consensus.
+        "agreement": "medium" if usable else "low",
+        "score": round(max(0.0, min(1.0, score)), 4),
+        "needs_review": not usable,
+        "basis": "single_pass_array_signal_quality",
+        "score_kind": "array_coherence_not_transcript_probability",
         "notes": (
-            "两种 ASR 与三路麦克风文本完全一致；机器转写仍可能听错，高影响事项必须复核。"
-            if exact_consensus
-            else "ASR 候选存在文本冲突；不得按整体相似度忽略单字差异，高影响事项必须回听或询问。"
+            "三麦已先做时延对齐和加权融合，再由 Qwen 单次转写。当前声学质量可供低风险理解；"
+            "转写仍可能听错，时间、金额、医疗、门锁、承诺和自动执行必须结合原音、上下文或询问复核。"
+            if usable else
+            "三麦融合退化或通道相干性偏低；文本只能作为检索线索，需要回听原音或询问后再形成认知。"
         ),
     }
-
-
-def sensevoice_consensus(alternatives: list[str]) -> str | None:
-    """Return the representative text only when all three microphones agree exactly."""
-    active = [text for text in alternatives if normalize_asr_text(text)]
-    if len(active) != 3:
-        return None
-    normalized = normalize_asr_text(active[0])
-    return active[0] if all(normalize_asr_text(text) == normalized for text in active[1:]) else None
-
-
-def apply_asr_adjudication(primary: str, alternatives: list[str], adjudicator_text: str | None) -> tuple[str, str]:
-    """Choose only when an independent adjudicator breaks a strong model conflict."""
-    consensus = sensevoice_consensus(alternatives)
-    if consensus is None or normalize_asr_text(primary) == normalize_asr_text(consensus):
-        return primary, "not_applicable"
-    if not adjudicator_text:
-        return primary, "unavailable"
-    normalized_adjudicator = normalize_asr_text(adjudicator_text)
-    if normalized_adjudicator == normalize_asr_text(consensus):
-        return consensus, "sensevoice_consensus_confirmed"
-    if normalized_adjudicator == normalize_asr_text(primary):
-        return primary, "primary_confirmed"
-    return primary, "three_way_conflict"
 
 
 def asr_timeout_budget(audio: Path, minimum_seconds: float, maximum_seconds: float = 300) -> float:
@@ -280,29 +246,6 @@ def acoustic_scene_with_playback(
     }
 
 
-def choose_microphone(transcripts: list[str]) -> int:
-    """Choose the transcript most similar to the other active microphones."""
-    if len(transcripts) != 3:
-        raise ValueError("expected exactly three microphone transcripts")
-    scores = [
-        sum(normalized_agreement(text, other) for j, other in enumerate(transcripts) if i != j)
-        for i, text in enumerate(transcripts)
-    ]
-    return max(range(3), key=lambda index: scores[index])
-
-
-def choose_microphone_result(results: list[tuple[int, str]]) -> int:
-    """Prefer cross-channel agreement, falling back to the strongest VAD result."""
-    texts = [text for _, text in results]
-    scores = [
-        sum(normalized_agreement(text, other) for j, other in enumerate(texts) if i != j)
-        for i, text in enumerate(texts)
-    ]
-    if max(scores, default=0.0) > 0:
-        return max(range(3), key=lambda index: scores[index])
-    return max(range(3), key=lambda index: (results[index][0], len(results[index][1])))
-
-
 def parse_capture_time(path: Path) -> dt.datetime:
     match = FILENAME_TIME.match(path.stem)
     if match:
@@ -371,18 +314,6 @@ def concatenate_audio(sources: list[Path], destination: Path) -> None:
     subprocess.run(command, check=True)
 
 
-def sensevoice(binary: Path, model: Path, vad: Path, audio: Path) -> tuple[int, str]:
-    result = subprocess.run(
-        [str(binary), "-m", str(model), "--vad", str(vad), "-a", str(audio)],
-        check=True, capture_output=True, text=True,
-    )
-    combined = "\n".join((result.stdout, result.stderr))
-    match = re.search(r"\[sensevoice\]\s+(\d+)\s+vad segments", combined)
-    segments = int(match.group(1)) if match else 0
-    text_lines = [line.strip() for line in result.stdout.splitlines() if line.strip() and not line.startswith("[sensevoice]")]
-    return segments, " ".join(text_lines)
-
-
 def vad_segments(binary: Path, model: Path, audio: Path) -> list[tuple[int, int]]:
     """Return FSMN-VAD intervals as millisecond pairs."""
     result = subprocess.run(
@@ -431,6 +362,15 @@ def extract_speech_audio(source: Path, destination: Path, segments: list[tuple[i
         "ffmpeg", "-v", "error", "-y", "-i", str(source),
         "-filter_complex", ";".join(filters), "-map", "[out]",
         "-ar", "16000", "-ac", "1", str(destination),
+    ], check=True)
+
+
+def archive_asr_derivative(source: Path, destination: Path) -> None:
+    """Persist the exact mono waveform heard by ASR as a lossless FLAC."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run([
+        "ffmpeg", "-v", "error", "-y", "-i", str(source),
+        "-c:a", "flac", "-compression_level", "8", str(destination),
     ], check=True)
 
 
@@ -496,21 +436,15 @@ class EvidenceProcessor:
         for program in ("ffmpeg", "ffprobe"):
             if not shutil.which(program):
                 raise RuntimeError(f"缺少依赖程序：{program}")
-        for path in (self.args.sense_binary, self.args.vad_binary, self.args.sense_model, self.args.vad_model):
+        for path in (self.args.vad_binary, self.args.vad_model):
             if not path.is_file():
                 raise RuntimeError(f"缺少模型或程序：{path}")
-        if self.args.firered_enabled:
-            required = (
-                self.args.firered_python,
-                self.args.firered_script,
-                self.args.firered_source_dir / "fireredasr2s/fireredasr2/asr.py",
-                self.args.firered_model_dir / "model.pth.tar",
-            )
-            for path in required:
-                if not path.is_file():
-                    raise RuntimeError(f"缺少 FireRed 仲裁程序或模型：{path}")
-            if not self.args.firered_deps_dir.is_dir():
-                raise RuntimeError(f"缺少 FireRed Python 依赖目录：{self.args.firered_deps_dir}")
+        if (
+            self.args.array_max_delay_ms <= 0
+            or not 0 <= self.args.array_min_coherence <= 1
+            or not 1 / 3 <= self.args.array_reference_weight <= 1
+        ):
+            raise RuntimeError("阵列时延上限必须为正数；相干性阈值为 0..1；参考通道权重为 1/3..1")
         self.args.input_dir.mkdir(parents=True, exist_ok=True)
         self.args.evidence_dir.mkdir(parents=True, exist_ok=True)
         self.args.discard_dir.mkdir(parents=True, exist_ok=True)
@@ -546,26 +480,6 @@ class EvidenceProcessor:
         finally:
             signal.setitimer(signal.ITIMER_REAL, 0)
             signal.signal(signal.SIGALRM, previous_handler)
-
-    def firered_transcribe(self, audio: Path) -> dict | None:
-        """Run the memory-heavy model out of process so its RAM is reclaimed."""
-        if not self.args.firered_enabled:
-            return None
-        timeout = asr_timeout_budget(audio, self.args.firered_timeout_seconds, self.args.asr_max_timeout_seconds)
-        try:
-            result = subprocess.run([
-                str(self.args.firered_python), str(self.args.firered_script),
-                "--audio", str(audio),
-                "--source-dir", str(self.args.firered_source_dir),
-                "--deps-dir", str(self.args.firered_deps_dir),
-                "--model-dir", str(self.args.firered_model_dir),
-            ], check=True, capture_output=True, text=True, timeout=timeout)
-            lines = [line for line in result.stdout.splitlines() if line.strip()]
-            payload = json.loads(lines[-1])
-            return payload if isinstance(payload, dict) else None
-        except (subprocess.SubprocessError, OSError, ValueError, json.JSONDecodeError) as error:
-            logging.warning("FireRed 按需仲裁失败，保留 Qwen 主结果和 SenseVoice 候选：%s", error)
-            return None
 
     def audio_tag(self, audio: Path) -> dict | None:
         if not getattr(self.args, "audio_tagging_enabled", False):
@@ -645,7 +559,6 @@ class EvidenceProcessor:
         *,
         classification: str,
         classifier: dict,
-        pending_event: Path | None = None,
     ) -> Path:
         """Move an unhelpful recording to recoverable quarantine with an audit record."""
         digest = sha256_file(source)
@@ -656,11 +569,6 @@ class EvidenceProcessor:
         if quarantine.exists() or manifest.exists():
             raise RuntimeError(f"隔离目标已存在，拒绝覆盖：{quarantine}")
         source.replace(quarantine)
-
-        rejected_event = None
-        if pending_event is not None and pending_event.is_file():
-            rejected_event = quarantine.with_suffix(quarantine.suffix + ".event.rejected")
-            pending_event.replace(rejected_event)
 
         classified_at = dt.datetime.now(dt.timezone.utc)
         record = {
@@ -673,8 +581,6 @@ class EvidenceProcessor:
             "quarantine_audio": quarantine.name,
             "classifier": classifier,
         }
-        if rejected_event is not None:
-            record["rejected_event"] = rejected_event.name
         atomic_json(manifest, record)
         logging.info("%s，已隔离 %s 小时后再删除：%s", classification, self.args.discard_grace_hours, quarantine)
         return quarantine
@@ -701,29 +607,6 @@ class EvidenceProcessor:
         })
         logging.error("主转写失败，原音已永久保留且不向 Agent 发布：%s（%s）", evidence_audio, reason)
         return evidence_audio
-
-    @staticmethod
-    def is_single_channel_false_positive(event: dict) -> bool:
-        """Recognize the known fan-noise failure: empty primary plus <=1 active mic."""
-        if str(event.get("transcript", "")).strip():
-            return False
-        transcripts = (
-            event.get("provenance", {})
-            .get("cross_check", {})
-            .get("all_microphone_transcripts", [])
-        )
-        return (
-            isinstance(transcripts, list)
-            and len(transcripts) == 3
-            and sum(bool(str(text).strip()) for text in transcripts) <= 1
-        )
-
-    @staticmethod
-    def pending_audio_path(pending: Path) -> Path:
-        suffix = ".event.pending.json"
-        if not pending.name.endswith(suffix):
-            raise ValueError(f"不是 pending 事件文件：{pending}")
-        return pending.with_name(pending.name.removesuffix(suffix))
 
     def defer_pending(self, pending: Path, error: Exception) -> None:
         attempts = self.pending_retry_attempts.get(pending, 0) + 1
@@ -804,9 +687,14 @@ class EvidenceProcessor:
                 concatenate_audio([items[channel] for items in source_microphones], output)
                 microphones.append(output)
 
-            window_results = [sensevoice(self.args.sense_binary, self.args.sense_model, self.args.vad_model, audio) for audio in microphones]
-            channel = choose_microphone_result(window_results)
-            speech_segments = vad_segments(self.args.vad_binary, self.args.vad_model, microphones[channel])
+            channel_vad = [
+                vad_segments(self.args.vad_binary, self.args.vad_model, microphone)
+                for microphone in microphones
+            ]
+            speech_segments = fuse_vad_segments(
+                channel_vad,
+                min_channels=self.args.array_min_vad_channels,
+            )
             overlapping = [(start, end) for start, end in speech_segments if start < boundary_ms and end > 0]
             carry = self.read_carry(source)
             if not overlapping:
@@ -820,10 +708,20 @@ class EvidenceProcessor:
                     self.consume_carry(source)
                     logging.warning("边界延续状态存在但当前 VAD 未复现，已保守保留原音：%s", evidence_audio)
                     return "continuation"
+                any_channel_segments = fuse_vad_segments(channel_vad, min_channels=1)
+                single_channel_activity = any(
+                    start < boundary_ms and end > 0 for start, end in any_channel_segments
+                )
                 self.quarantine_audio(
                     source,
-                    classification="no_speech",
-                    classifier={"model": "SenseVoiceSmall-Q8", "vad": "FSMN-VAD", "channels_checked": 3},
+                    classification="single_channel_activity" if single_channel_activity else "no_speech",
+                    classifier={
+                        "vad": "FSMN-VAD",
+                        "channels_checked": 3,
+                        "minimum_support": self.args.array_min_vad_channels,
+                        "per_channel_segment_counts": [len(segments) for segments in channel_vad],
+                        "reason": "speech_requires_cross_microphone_vad_support",
+                    },
                 )
                 self.consume_carry(source)
                 return "discarded"
@@ -845,11 +743,19 @@ class EvidenceProcessor:
                 speech_output = temporary_dir / f"speech-mic-{mic_channel}.wav"
                 extract_speech_audio(microphone, speech_output, owned_segments)
                 speech_microphones.append(speech_output)
-            sense_results = [sensevoice(self.args.sense_binary, self.args.sense_model, self.args.vad_model, audio) for audio in speech_microphones]
-            texts = [text for _, text in sense_results]
-            channel = choose_microphone_result(sense_results)
+            enhanced_speech = temporary_dir / "speech-array-enhanced.wav"
+            enhancement = enhance_speech_audio(
+                microphones,
+                enhanced_speech,
+                owned_segments,
+                max_delay_ms=self.args.array_max_delay_ms,
+                min_coherence=self.args.array_min_coherence,
+                reference_weight=self.args.array_reference_weight,
+            )
+            channel = enhancement["reference_channel"]
             try:
-                primary = self.qwen_transcribe(speech_microphones[channel])
+                # This is the only speech-recognition call in the production path.
+                primary = self.qwen_transcribe(enhanced_speech)
             except TranscriptionTimeout as error:
                 self.preserve_processing_failure(
                     source,
@@ -858,42 +764,29 @@ class EvidenceProcessor:
                         "model": "Qwen3-ASR-1.7B",
                         "device": "cpu",
                         "timeout_seconds": error.timeout_seconds,
-                        "selected_microphone": channel,
+                        "input": "three_microphone_array_enhanced_mono",
                         "speech_segments_ms": owned_segments,
-                        "sensevoice_transcripts": texts,
+                        "array_enhancement": enhancement,
                         "error": str(error),
                     },
                 )
                 self.consume_carry(source)
                 return "processing_failed"
-            active_channels = sum(bool(text.strip()) for text in texts)
-            if not primary and active_channels <= 1:
+            if not primary:
                 self.quarantine_audio(
                     source,
                     classification="no_reliable_speech",
                     classifier={
                         "primary_model": "Qwen3-ASR-1.7B",
                         "primary_transcript_empty": True,
-                        "cross_check_model": "SenseVoiceSmall-Q8",
                         "vad": "FSMN-VAD",
-                        "active_channels": active_channels,
                         "channels_checked": 3,
+                        "array_enhancement": enhancement,
                     },
                 )
                 self.consume_carry(source)
                 return "discarded"
-
-            consensus = sensevoice_consensus(texts)
-            firered = None
-            adjudication_triggered = consensus is not None and normalize_asr_text(primary) != normalize_asr_text(consensus)
-            adjudication_attempted = adjudication_triggered and self.args.firered_enabled
-            if adjudication_triggered:
-                firered = self.firered_transcribe(speech_microphones[channel])
-            selected_transcript, adjudication_result = apply_asr_adjudication(
-                primary,
-                texts,
-                firered.get("text") if firered else None,
-            )
+            selected_transcript = primary
 
             speakers, speaker_embeddings, diarization_status = self.diarize(
                 microphones[channel],
@@ -921,6 +814,17 @@ class EvidenceProcessor:
             if evidence_audio.exists():
                 raise RuntimeError(f"证据文件已存在，拒绝覆盖：{evidence_audio}")
             source.replace(evidence_audio)
+            enhanced_audio = evidence_audio.with_suffix(".asr.flac")
+            if enhanced_audio.exists():
+                raise RuntimeError(f"ASR 派生音频已存在，拒绝覆盖：{enhanced_audio}")
+            archive_asr_derivative(enhanced_speech, enhanced_audio)
+            enhanced_relative = enhanced_audio.relative_to(self.args.evidence_dir)
+            enhanced_ref = {
+                "uri": f"{self.args.nas_uri_root.rstrip('/')}/{enhanced_relative.as_posix()}",
+                "sha256": sha256_file(enhanced_audio),
+                "sample_rate": enhancement["sample_rate"],
+                "channels": 1,
+            }
 
             referenced_sources = sources if event_end_ms > boundary_ms and lookahead is not None else [source]
             referenced_durations = durations_ms[:len(referenced_sources)]
@@ -954,7 +858,7 @@ class EvidenceProcessor:
                 speech_segments_seconds,
                 playback_matches,
             )
-            audio_tagging = self.audio_tag(speech_microphones[channel])
+            audio_tagging = self.audio_tag(enhanced_speech)
             try:
                 spatial_features = array_spatial_features(speech_microphones)
             except (OSError, ValueError, RuntimeError) as error:
@@ -984,21 +888,7 @@ class EvidenceProcessor:
                 for speaker in filtered_speakers
             ]
 
-            reliability = asr_reliability(primary, texts)
-            if adjudication_result == "sensevoice_consensus_confirmed":
-                reliability["notes"] += " FireRed 独立复核支持三麦 SenseVoice 共识，已将其作为展示文本；原始模型冲突仍需保留并可回听。"
-            alternatives = [
-                {"model": "SenseVoiceSmall", "version": "Q8-GGUF", "text": text}
-                for text in texts if text
-            ]
-            if normalize_asr_text(selected_transcript) != normalize_asr_text(primary):
-                alternatives.insert(0, {"model": "Qwen3-ASR", "version": "1.7B-CPU-FP32", "text": primary})
-            elif firered and firered.get("text"):
-                alternatives.append({
-                    "model": "FireRedASR2-AED",
-                    "version": "FP32-CPU",
-                    "text": firered["text"],
-                })
+            reliability = asr_reliability(primary, enhancement)
             event = {
                 "event_id": f"audio-{identity[:24]}",
                 "occurred_at": occurred.isoformat(),
@@ -1010,7 +900,7 @@ class EvidenceProcessor:
                 "playback_refs": playback_refs,
                 "transcript": selected_transcript,
                 "language": "zh",
-                "alternatives": alternatives,
+                "alternatives": [],
                 "speakers": filtered_speakers,
                 "acoustic_scene": acoustic_scene,
                 "scene": scene,
@@ -1022,28 +912,24 @@ class EvidenceProcessor:
                         "model": "Qwen3-ASR-1.7B",
                         "runtime": "qwen-asr",
                         "device": "cpu",
-                        "selected_microphone": channel,
-                        "input": "fsmn_vad_speech_regions_concatenated",
+                        "calls": 1,
+                        "language": "Chinese",
+                        "input": "gcc_phat_weighted_delay_and_sum_mono",
+                        "input_audio": enhanced_ref,
                         "speech_segments_ms": owned_segments,
                     },
-                    "cross_check": {"model": "SenseVoiceSmall-Q8", "vad": "FSMN-VAD", "all_microphone_transcripts": texts},
-                    "adjudication": {
-                        "enabled": self.args.firered_enabled,
-                        "trigger": "three_microphone_sensevoice_consensus_conflicts_with_qwen",
-                        "triggered": adjudication_triggered,
-                        "attempted": adjudication_attempted,
-                        "completed": firered is not None,
-                        "model": "FireRedASR2-AED",
-                        "device": "cpu",
-                        "result": adjudication_result,
-                        "text": firered.get("text") if firered else None,
-                        "confidence": firered.get("confidence") if firered else None,
-                        "timestamps": firered.get("timestamps", []) if firered else [],
-                        "load_seconds": firered.get("load_seconds") if firered else None,
-                        "inference_seconds": firered.get("inference_seconds") if firered else None,
+                    "array_vad": {
+                        "model": "FSMN-VAD",
+                        "channels_checked": 3,
+                        "minimum_support": self.args.array_min_vad_channels,
+                        "per_channel_segment_counts": [len(segments) for segments in channel_vad],
+                        "fused_segments_ms": speech_segments,
                     },
+                    "array_enhancement": enhancement,
                     "audio": {
                         "storage_blocks": properties,
+                        "raw_source": "48kHz_24bit_3channel_lossless_flac",
+                        "asr_derivative": enhanced_ref,
                         "fixed_block_seconds": properties[0]["duration_seconds"],
                         "lookahead_used": lookahead is not None,
                         "boundary_ownership": "utterance_start",
@@ -1090,7 +976,10 @@ class EvidenceProcessor:
             if self.args.zeris_url:
                 pending.replace(evidence_audio.with_suffix(evidence_audio.suffix + ".event.json"))
                 self.finish_pending(pending)
-            logging.info("已保留跨边界语音证据：%s（%d 个 VAD 区间，模型一致度 %.3f）", evidence_audio, len(owned_segments), reliability["score"])
+            logging.info(
+                "已保留跨边界语音证据：%s（%d 个 VAD 区间，三麦融合质量 %.3f，ASR 调用 1 次）",
+                evidence_audio, len(owned_segments), reliability["score"],
+            )
             return "evidence"
 
     def retry_pending_events(self) -> int:
@@ -1102,22 +991,6 @@ class EvidenceProcessor:
                 continue
             try:
                 event = json.loads(pending.read_text(encoding="utf-8"))
-                if self.is_single_channel_false_positive(event):
-                    audio = self.pending_audio_path(pending)
-                    if audio.is_file():
-                        self.quarantine_audio(
-                            audio,
-                            classification="no_reliable_speech",
-                            classifier={
-                                "primary_model": "Qwen3-ASR-1.7B",
-                                "primary_transcript_empty": True,
-                                "cross_check_model": "SenseVoiceSmall-Q8",
-                                "reason": "recovered_single_channel_false_positive",
-                            },
-                            pending_event=pending,
-                        )
-                        self.finish_pending(pending)
-                        continue
                 self.post_event(event)
                 pending.replace(Path(str(pending).replace(".event.pending.json", ".event.json")))
                 self.finish_pending(pending)
