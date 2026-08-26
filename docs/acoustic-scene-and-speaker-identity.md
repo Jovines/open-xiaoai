@@ -16,22 +16,22 @@
 ## 当前能力与缺口
 
 - 原始证据是 `48 kHz / 3 通道 / 24-bit FLAC`；小爱自身部分播放路径另有同步 PCM reference。
-- Qwen3-ASR-1.7B 是 CPU 主转写，三路 SenseVoice 是异构候选，FireRedASR2-AED 只在特定强冲突时仲裁。
+- 三路 FSMN-VAD 先形成至少两麦支持的语音区间；GCC-PHAT 与参考通道保护型加权融合生成一条单声道，Qwen3-ASR-1.7B 在 CPU 上只转写一次。
 - sherpa-onnx 已用 Pyannote segmentation + 中文 3D-Speaker 做单文件匿名 diarization。
 - `recording-speaker-00` 仍只表示单份录音内的聚类；处理器现在额外提取质量门控后的 3D-Speaker embedding，并在本机私有文件中维护跨录音匿名 profile。姓名必须由家庭所有者人工确认，且当前缺少可靠回放分数时不会向 Zeris 暴露姓名。
 - 小爱播放继续以数字 PCM reference 为最高优先级。无 reference 时新增 CED-mini int8 粗标签、三麦几何无关的电平/时差特征，以及语言和重复模式融合；“手机语言学习外放”只作为概率候选，不能据此声称具体应用就是多邻国。
-- Qwen3-ASR 支持 context/hotwords，但家庭原音实测表明上下文可能改变不清晰词而不一定恢复原话。生产必须同时保留无提示结果和有界词表候选，禁止用热词结果静默覆盖原转写。
+- Qwen3-ASR 支持 context/hotwords，但家庭原音实测表明上下文可能改变不清晰词而不一定恢复原话。生产保持无提示单次结果；热词和其他模型只允许进入离线评测，禁止静默覆盖原转写。
 
 ## 推荐流水线
 
 ```text
 三麦原音 + 小爱播放 reference
-  -> VAD / 信号质量 / 播放延迟校准
+  -> 三麦 VAD 共识 / 逐段 GCC-PHAT / 参考通道保护型加权融合
+  -> 单条增强音频 / Qwen 单次 ASR
   -> 粗粒度 AudioSet 标签 + 阵列空间特征 + 回放检测
   -> 概率化声学场景
   -> 人声区间 diarization
   -> 质量门控后的说话人 embedding 与长期匿名档案
-  -> 多模型 ASR（无提示主结果 + 有界家庭词表候选）
   -> 可追溯语义候选（补货、快递、日程、异常）
   -> 风险分级：记录候选 / 低打扰确认 / 交叉验证 / 禁止动作
 ```
@@ -54,7 +54,7 @@
 | 回放检测 | AASIST/AASIST-L、ASVspoof Physical Access 基线 | 只作真人近场与扬声器回放的一个分数。公开模型主要面向反欺骗数据，不可直接宣称能识别真实家庭中的手机、电视或小爱；必须用本房间、本麦克风和多种音量/距离重新校准。 |
 | 单文件 diarization | Pyannote community、3D-Speaker、WeSpeaker、sherpa-onnx | 继续使用 sherpa-onnx Pyannote segmentation + 3D-Speaker，CPU 和现有代码最匹配。Pyannote community-1 可离线作为质量上限对照，但不先放入常驻处理链。 |
 | 长期说话人识别 | 3D-Speaker CAM++/ERes2Net、WeSpeaker | 当前中文 ERes2Net 可先作为基线；补测更轻的 CAM++ ONNX。只在非回放、非重叠、足够长且信噪比合格的人声上更新档案。 |
-| 阵列定位/分离 | GCC-PHAT/SRP-PHAT、ODAS | ODAS 能在低成本 CPU 上做定位、跟踪、分离，但必须先拿到或标定 OH2P 三麦几何与通道顺序。方向是旁证，不等于设备类型。 |
+| 阵列增强/定位 | GCC-PHAT、MVDR、SRP-PHAT、ODAS | 生产先用不依赖几何的 GCC-PHAT 时延对齐与加权融合。等权融合会改写中文短词，因此固定全句参考麦克风并至少保留 70% 权重。MVDR/ODAS 只有在拿到或标定 OH2P 三麦几何、且家庭中文 CER 明确改善后才可替换。方向是旁证，不等于设备类型。 |
 
 主要上游：
 

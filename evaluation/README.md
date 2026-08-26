@@ -14,7 +14,7 @@
 
 ## 清单格式
 
-清单使用 JSON Lines，每行至少包含 `id`、相对 `audio` 和人工 `reference`；可选 `critical_terms`、`tags`、`channel`、`start_seconds`、`duration_seconds`。音频不提交 Git，只提交无隐私的标签和清单。当前受控样本放在 NAS 的 `录音/evaluation/controlled/`。
+清单使用 JSON Lines，每行至少包含 `id`、相对 `audio` 和人工 `reference`；可选 `critical_terms`、`tags`、`channel`、`start_seconds`、`duration_seconds`。三麦原音还可指定 `preprocessing=oh2p_channel|oh2p_array_enhanced` 和明确的 `segments_ms`，让单路与融合输入使用完全相同的语音边界。音频不提交 Git，只提交无隐私的标签和清单。当前受控样本放在 NAS 的 `录音/evaluation/controlled/` 或不可变 `evidence/`。
 
 ```bash
 set -a
@@ -39,13 +39,27 @@ CUDA_VISIBLE_DEVICES='' ~/.venvs/qwen3-asr/bin/python -m evaluation.asr_benchmar
 
 公开普通话集合用于测模型基础能力，真实房间集合用于测距离、风扇、混响、多人重叠和小爱外放。二者必须分别报告，不能把公开集低 CER 当作家庭场景已经可靠。可按照 [Qwen3-ASR 官方评测](https://github.com/QwenLM/Qwen3-ASR) 使用 WenetSpeech/AISHELL/Fleurs，也可导入 [SenseVoice 官方 CPU benchmark](https://github.com/FunAudioLLM/SenseVoice/blob/main/runtime/llama.cpp/BENCHMARKS.md) 的人工标注样本；导入时转换为上述 JSONL，不修改原始音频和标注。
 
-模型进入生产主路径前至少满足：真实家庭集关键短语准确率不低于当前版本，micro-CER 不倒退，CPU RTF 小于 1，并且任何模型分歧继续以多个候选和 `fallible_asr` 上报，不能静默选择更“通顺”的文本。
+模型或阵列算法进入生产主路径前至少满足：真实家庭集关键短语准确率不低于当前版本，micro-CER 不倒退，CPU RTF 小于 1。生产固定为“一个增强波形、一次主 ASR”；其他模型和融合变体只在离线评测中比较，不能静默覆盖生产文本。所有生产文本继续标记为 `fallible_asr`。
 
 ## 当前受控基线
 
 2026-08-25 的首个基线包含同一句小爱 TTS 的数字 reference，以及 `×256 / ×128 / ×96` 三次真实房间回录。三模型同轮单次报告保存在 NAS `controlled-three-models.json`：Qwen3-ASR-1.7B CPU FP32 的整体 micro-CER 为 5.56%、关键短语准确率 50%、RTF 0.70；SenseVoiceSmall-Q8 为 8.33%、87.5%、0.07；Fun-ASR-Nano-2512 Q8 为 8.33%、87.5%、0.19。SenseVoice 和 Fun-ASR-Nano 的三个房间样本 CER 都为 0，但两者共享同系编码器且没有在本集合提供额外纠错价值，因此 Fun-ASR-Nano 暂不进入生产常驻路径。
 
-FireRedASR2-AED FP32 CPU 单独批测四条时整体 micro-CER 为 1.39%、关键短语准确率 87.5%、推理 RTF 0.72；三个房间样本全部正确，数字 reference 把“原有”错成“人有”。它对生产同形态的 6.67 秒 VAD 单声道样本冷启动 5.9 秒、推理 4.9 秒、峰值内存约 9.6 GB。生产据此采用“强冲突时隔离进程按需仲裁”，而不是把第三个大模型常驻。GLM-ASR-Nano 等候选继续留在扩展评测池；在现有四条小样本不足以证明增益前，不再引入另一套大运行时。样本太少，以上结果只证明当前分工合理，不代表通用模型排名。
+FireRedASR2-AED FP32 CPU 的历史离线批测四条时整体 micro-CER 为 1.39%、关键短语准确率 87.5%、推理 RTF 0.72；三个房间样本全部正确，数字 reference 把“原有”错成“人有”。它的峰值内存约 9.6 GB。该结果保留为模型研究记录，但生产已移除多模型仲裁；SenseVoice、Fun-ASR-Nano、FireRed 和 GLM-ASR-Nano 仅留在扩展评测池。样本太少，以上结果不代表通用模型排名。
+
+### 三麦融合基线（2026-08-27）
+
+`array-controlled.jsonl` 对 4 条有人工真值的三麦原音各生成两份同边界输入：麦克风 1 单路，以及 GCC-PHAT 对齐后“固定参考通道 70% + 其余通道 30%”的增强单声道。等权融合在探索中会把“小爱”改成“小雅”，因此被门禁淘汰；参考保护版本与单路在当前 4 条上均为 micro-CER 0、关键短语 100%，增强版 RTF 0.412。正式报告位于 NAS `录音/evaluation/results/array-controlled-reference70.json`。
+
+```bash
+CUDA_VISIBLE_DEVICES='' ~/.venvs/qwen3-asr/bin/python -m evaluation.asr_benchmark \
+  --manifest evaluation/array-controlled.jsonl \
+  --audio-root /mnt/dx4600/家庭管家/录音 \
+  --engine qwen --repeat 1 \
+  --output /mnt/dx4600/家庭管家/录音/evaluation/results/array-controlled-reference70.json
+```
+
+4 条只是一道防回归门，不足以宣称算法普遍优于最佳单麦。后续重点补充远场、风扇、多人重叠、真人与小爱同时说话和不同方位的人工校对样本；任何一个关键短语倒退都阻止自动升级。
 
 增益对照中，房间语音满幅削波比例从 `×256` 的 1.581973% 降至 `×128` 的 0.062687%，最终 `×96` 为 0.002811%；模型的房间样本 CER 未因降增益退化。生产因此采用 `×96`。初始机器报告保存在 NAS `录音/evaluation/results/controlled-gain96.json`。
 

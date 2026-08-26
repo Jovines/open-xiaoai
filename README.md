@@ -6,11 +6,11 @@
 
 1. `recorder.py` 只建立一条长期 SSH/`arecord` 音频流，以准确的样本数切成 60 秒存储块；切段时不会重新连接音箱，因此边界处没有采集空洞。
 2. 原音以 `48 kHz / 3 通道 / 24-bit FLAC` 无损保存。硬件提供四路 PCM，其中第四路恒为零，因此不归档。A113 低位样本使用 `×96` 映射，在受控外放中相对旧 `×256` 将削波减少约 560 倍，同时保留约 8.5 dB 头部空间。
-3. `processor.py` 分别检查三支麦克风。FSMN-VAD/SenseVoice 判断没有语音的段先隔离 72 小时，核对哈希后才删除；分类清单永久留下。若只有一路被噪声误触发、而 Qwen 主转写为空，也按 `no_reliable_speech` 进入同样的可恢复隔离。
+3. `processor.py` 用 FSMN-VAD 分别检查三支麦克风，至少两路同时支持才进入语音链路。没有语音或只有一路被风扇等噪声误触发的存储块先隔离 72 小时，核对哈希后才删除；分类清单永久留下。
 4. 处理器会等待下一分钟落盘，再把“当前块 + 下一块”作为连续窗口运行 FSMN-VAD。话语按开始时间唯一归属：若从当前块末尾说到下一块开头，上一事件取得完整尾巴，持久化 carry 状态让下一块不重复转写；采集停止时，最后一块等待 75 秒后自动降级为单块处理。
-5. 有语音的整段原音进入 `evidence/`。只把毫秒级语音区间（两端各保留 200 ms）拼接给 CPU 上的 Qwen3-ASR-1.7B；原始 60 秒三通道音频完全不裁剪。跨界事件携带所有相关 FLAC 的 NAS URI、SHA-256 和块内偏移，能够重建并校验原话。SenseVoiceSmall 从三路麦克风独立生成候选；只有 Qwen 与三路候选归一化后完全一致才算高一致度。若三路 SenseVoice 完全一致却与 Qwen 冲突，才临时启动 CPU 上的 FireRedASR2-AED 仲裁；它确认三麦共识时可修正展示文本，但事件仍保留全部候选并强制 `needs_review`。FireRed 超时、缺失或失败只会回退 Qwen，不会阻断归档。Qwen 和 FireRed 的 CPU 看门狗采用动态预算：至少 180 秒，长语音按“30 秒 + 语音时长 × 3”放宽，最多 300 秒；一分钟连续讲话可用 210 秒。看门狗只处理真正卡死，不能为了追队列而牺牲正常转写。Qwen 若最终超时，原音永久保留为 `.processing_failed.json`，不向 Agent 发布错误文本。
+5. 有语音的整段原音进入 `evidence/`。每个毫秒级语音区间先在三麦之间做 GCC-PHAT 时延估计，再以“全句固定最佳参考通道 70% + 其余相干通道 30%”加权融合；低相干、削波或异常电平通道会降权，无法安全融合时退回最佳单路并标记需复核。增强后的 `16 kHz / mono / lossless FLAC` 也会归档，能准确重放模型当时听到的输入。Qwen3-ASR-1.7B 只转写这一个增强结果一次，不再对三支麦克风分别转写，也没有生产仲裁模型。原始 60 秒三通道音频完全不裁剪；跨界事件携带所有相关 FLAC 的 NAS URI、SHA-256 和块内偏移，能够重建并校验原话。Qwen 的 CPU 看门狗采用动态预算：至少 180 秒，长语音按“30 秒 + 语音时长 × 3”放宽，最多 300 秒；一分钟连续讲话可用 210 秒。Qwen 若最终超时，原音永久保留为 `.processing_failed.json`，不向 Agent 发布错误文本。
 6. sherpa-onnx 用 Pyannote segmentation + 中文 3D-Speaker 在 CPU 上给出仅在当前录音内有效的匿名说话人片段；它不会猜姓名、性别，也不会把不同录音的 `speaker-00` 当成同一个人。
-7. 事件连同模型、运行设备、候选文本、原音 SHA-256 和 NAS 地址发给 Zeris。临时上报失败时保留 `.event.pending.json`，以 15 秒至 15 分钟指数退避重试；每个事件独立处理，一个坏事件不会阻塞之后的 VAD、转写或上报。永久拒绝的事件标为 `.event.rejected.json`，原音保留供人工复核。
+7. 事件连同模型、运行设备、阵列质量、原音与增强音频的 SHA-256/NAS 地址发给 Zeris。临时上报失败时保留 `.event.pending.json`，以 15 秒至 15 分钟指数退避重试；每个事件独立处理，一个坏事件不会阻塞之后的 VAD、转写或上报。永久拒绝的事件标为 `.event.rejected.json`，原音保留供人工复核。
 
 转写永远是 `fallible_asr`（可能听错的二手证据），不是事实。涉及时间、金额、医疗、门锁、承诺等高影响内容时，Agent 必须结合上下文、回听原音或询问家庭成员，不能仅凭转写执行。
 
@@ -25,8 +25,7 @@ OH2P 声卡拓扑、原厂进程边界、播放 fan-out 协议、内核兼容踩
 ## 实测基线
 
 - 10 秒中文家庭录音：Qwen3-ASR-1.7B 纯 CPU 推理约 6.3 秒，模型常驻约 13 GB RAM；GPU 不参与。
-- SenseVoiceSmall-Q8 同一录音约 0.5 秒、约 300 MB RAM，适合 VAD 和异构复核。
-- FireRedASR2-AED 对 6.67 秒 VAD 单声道样本冷启动约 5.9 秒、推理约 4.9 秒、峰值约 9.6 GB RAM；只在强冲突时作为短命子进程运行。
+- 三麦 VAD、GCC-PHAT 对齐和加权融合均为 CPU 信号处理，不调用语言模型；受控阵列集的增强输入 Qwen RTF 为 0.412。
 - 10 秒三通道无损 FLAC 约 3.3 MiB，即未经筛选约 28–30 GiB/天。NAS 临时承接全部原音，处理成功后只长期保留含语音的证据段。
 
 数字是当前 i7-12700 主机上的一次实测，不是性能承诺。N5105 小主机内存不足以舒适常驻 1.7B float32 模型，因此转写服务部署在当前主机，Zeris 仍运行在小主机。
@@ -45,9 +44,7 @@ sudo apt install ffmpeg openssh-client sshpass
 
 - `~/.venvs/qwen3-asr`：CPU 版 PyTorch 和 `qwen-asr`
 - `~/models/huggingface`：Qwen3-ASR-1.7B
-- `~/.local/opt/sensevoice/llama-funasr-sensevoice`
-- `~/models/sensevoice-small/{sensevoice-small-q8.gguf,fsmn-vad.gguf}`
-- `~/.local/opt/fireredasr2s`、`~/.local/opt/fireredasr2-deps-py312` 与 `~/models/fireredasr2-aed`：按需 CPU 仲裁
+- `~/.local/opt/sensevoice/llama-funasr-vad` 与 `~/models/sensevoice-small/fsmn-vad.gguf`：只做三麦语音区间检测，不做转写
 - `~/.venvs/sherpa-onnx` 与 `~/models/speaker-diarization/`：匿名说话人分离
 
 ## 短时测试
@@ -99,6 +96,6 @@ journalctl --user -u open-xiaoai-recorder.service -u open-xiaoai-processor.servi
 
 ## 当前边界
 
-- 三路内容高度相关，但简单求平均在实测中会降低识别效果；当前选择与其他两路结果最一致的一路给主模型，同时保留三路无损原音，后续可加入真正的阵列波束形成。
+- 等权平均会改写短词：真实样本中曾把“小爱”变成“小雅”。当前使用全句固定参考通道、70% 锚定权重和逐语音段 GCC-PHAT 对齐；4 条人工真值阵列样本的 Qwen micro-CER 与关键短语错误均为 0。样本仍很小，新增家庭人工标注必须持续进入回归集。
 - 匿名说话人分离已经接入，但跨录音声纹聚类、声纹注册和人工姓名标注尚未接入。加入后也必须把“这一段像谁”与经本人标注的身份分开，并允许人工纠错。
 - 持续录音会采集房间内所有可听声音。启用前应确保可能被录到的人知情同意，并限制 NAS 权限、备份范围和 Zeris 访问权。
