@@ -16,18 +16,19 @@
 ## 当前能力与缺口
 
 - 原始证据是 `48 kHz / 3 通道 / 24-bit FLAC`；小爱自身部分播放路径另有同步 PCM reference。
-- 三路 FSMN-VAD 先形成至少两麦支持的语音区间；GCC-PHAT 与参考通道保护型加权融合生成一条单声道，Qwen3-ASR-1.7B 在 CPU 上只转写一次。
+- 三路 FSMN-VAD 先形成至少两麦支持的语音区间；三个方向使用相同边界分别由 Qwen3-ASR-1.7B 在 CPU 上转写，全部候选未经采集层裁决直接交给 Zeris。GCC-PHAT 参考保护型融合继续生成阵列分析派生音频供回听和离线评测。
 - sherpa-onnx 已用 Pyannote segmentation + 中文 3D-Speaker 做单文件匿名 diarization。
 - `recording-speaker-00` 仍只表示单份录音内的聚类；处理器现在额外提取质量门控后的 3D-Speaker embedding，并在本机私有文件中维护跨录音匿名 profile。姓名必须由家庭所有者人工确认，且当前缺少可靠回放分数时不会向 Zeris 暴露姓名。
 - 小爱播放继续以数字 PCM reference 为最高优先级。无 reference 时新增 CED-mini int8 粗标签、三麦几何无关的电平/时差特征，以及语言和重复模式融合；“手机语言学习外放”只作为概率候选，不能据此声称具体应用就是多邻国。
-- Qwen3-ASR 支持 context/hotwords，但家庭原音实测表明上下文可能改变不清晰词而不一定恢复原话。生产保持无提示单次结果；热词和其他模型只允许进入离线评测，禁止静默覆盖原转写。
+- Qwen3-ASR 支持 context/hotwords，但家庭原音实测表明上下文可能改变不清晰词而不一定恢复原话。生产保持三个方向各自无提示的原始结果；热词和其他模型只允许进入离线评测，禁止静默覆盖方向观察。
 
 ## 推荐流水线
 
 ```text
 三麦原音 + 小爱播放 reference
-  -> 三麦 VAD 共识 / 逐段 GCC-PHAT / 参考通道保护型加权融合
-  -> 单条增强音频 / Qwen 单次 ASR
+  -> 三麦 VAD 共识 / 三个方向提取相同语音边界
+  -> 三路独立 Qwen ASR / 不投票、不要求一致
+  -> 全部候选与出处交给 Zeris 主脑理解
   -> 粗粒度 AudioSet 标签 + 阵列空间特征 + 回放检测
   -> 概率化声学场景
   -> 人声区间 diarization
