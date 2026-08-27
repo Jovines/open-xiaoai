@@ -39,7 +39,7 @@ CUDA_VISIBLE_DEVICES='' ~/.venvs/qwen3-asr/bin/python -m evaluation.asr_benchmar
 
 公开普通话集合用于测模型基础能力，真实房间集合用于测距离、风扇、混响、多人重叠和小爱外放。二者必须分别报告，不能把公开集低 CER 当作家庭场景已经可靠。可按照 [Qwen3-ASR 官方评测](https://github.com/QwenLM/Qwen3-ASR) 使用 WenetSpeech/AISHELL/Fleurs，也可导入 [SenseVoice 官方 CPU benchmark](https://github.com/FunAudioLLM/SenseVoice/blob/main/runtime/llama.cpp/BENCHMARKS.md) 的人工标注样本；导入时转换为上述 JSONL，不修改原始音频和标注。
 
-模型或阵列算法进入生产主路径前至少满足：真实家庭集关键短语准确率不低于当前版本，micro-CER 不倒退，CPU RTF 小于 1。生产固定为“一个增强波形、一次主 ASR”；其他模型和融合变体只在离线评测中比较，不能静默覆盖生产文本。所有生产文本继续标记为 `fallible_asr`。
+模型或阵列算法进入生产主路径前至少满足：真实家庭集关键短语准确率不低于当前版本，micro-CER 不倒退，并且长期吞吐不会形成不可控积压。生产保留三个方向的独立 Qwen 转写，由 Zeris 直接理解未裁决候选；融合算法和其他模型继续在离线评测中比较，不能静默覆盖任何一个方向的原始观察。所有生产文本继续标记为 `fallible_asr`。
 
 ## 当前受控基线
 
@@ -50,6 +50,8 @@ FireRedASR2-AED FP32 CPU 的历史离线批测四条时整体 micro-CER 为 1.39
 ### 三麦融合基线（2026-08-27）
 
 `array-controlled.jsonl` 对 4 条有人工真值的三麦原音各生成两份同边界输入：麦克风 1 单路，以及 GCC-PHAT 对齐后“固定参考通道 70% + 其余通道 30%”的增强单声道。等权融合在探索中会把“小爱”改成“小雅”，因此被门禁淘汰；参考保护版本与单路在当前 4 条上均为 micro-CER 0、关键短语 100%，增强版 RTF 0.412。正式报告位于 NAS `录音/evaluation/results/array-controlled-reference70.json`。
+
+同日补测三个物理通道：麦克风 0 的 micro-CER 为 6.10%、关键短语 75%，麦克风 1、麦克风 2 和参考保护融合均为 CER 0、关键短语 100%。这说明方向会改变最佳通道，也说明当前小样本无法证明融合胜过最佳单麦。生产因此不把阵列质量启发式冒充语义真值，而是把三路转写完整交给 Zeris；评测继续决定未来是否更换声学前端。
 
 ```bash
 CUDA_VISIBLE_DEVICES='' ~/.venvs/qwen3-asr/bin/python -m evaluation.asr_benchmark \
