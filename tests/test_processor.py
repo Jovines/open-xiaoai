@@ -44,6 +44,7 @@ class ProcessorTests(unittest.TestCase):
             zeris_token="test",
             qwen_timeout_seconds=0.02,
             qwen_max_new_tokens=384,
+            qwen_device="cpu",
             array_min_vad_channels=2,
             array_max_delay_ms=2.0,
             array_min_coherence=0.15,
@@ -288,6 +289,21 @@ class ProcessorTests(unittest.TestCase):
             processor.qwen.transcribe.side_effect = lambda *args, **kwargs: __import__("time").sleep(1)
             with self.assertRaises(TranscriptionTimeout):
                 processor.qwen_transcribe(Path(directory) / "audio.wav")
+
+    def test_gpu_directional_batch_preserves_result_order(self):
+        with tempfile.TemporaryDirectory() as directory:
+            processor = self.make_processor(directory)
+            processor.qwen = mock.Mock()
+            processor.qwen.transcribe.return_value = [
+                SimpleNamespace(text="左侧"),
+                SimpleNamespace(text="正面"),
+                SimpleNamespace(text="右侧"),
+            ]
+            audios = [Path("mic-0.wav"), Path("mic-1.wav"), Path("mic-2.wav")]
+            self.assertEqual(processor.qwen_transcribe_many(audios), ["左侧", "正面", "右侧"])
+            processor.qwen.transcribe.assert_called_once_with(
+                ["mic-0.wav", "mic-1.wav", "mic-2.wav"], language="Chinese",
+            )
 
     def test_processing_failure_is_preserved_without_expiry(self):
         with tempfile.TemporaryDirectory() as directory:

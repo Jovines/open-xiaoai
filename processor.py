@@ -37,7 +37,7 @@ class EventPostError(RuntimeError):
 
 
 class TranscriptionTimeout(RuntimeError):
-    """The primary ASR exceeded the per-recording CPU time budget."""
+    """The primary ASR exceeded the per-recording time budget."""
 
     def __init__(self, message: str, *, timeout_seconds: float) -> None:
         super().__init__(message)
@@ -60,6 +60,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--array-min-coherence", type=float, default=float(os.environ.get("ARRAY_MIN_COHERENCE", "0.15")))
     parser.add_argument("--array-reference-weight", type=float, default=float(os.environ.get("ARRAY_REFERENCE_WEIGHT", "0.70")))
     parser.add_argument("--qwen-model", default=os.environ.get("QWEN_ASR_MODEL", "Qwen/Qwen3-ASR-1.7B"))
+    parser.add_argument("--qwen-device", choices=("cpu", "cuda"), default=os.environ.get("QWEN_ASR_DEVICE", "cpu"))
     parser.add_argument("--qwen-cpu-threads", type=int, default=int(os.environ.get("QWEN_ASR_CPU_THREADS", "16")))
     parser.add_argument("--qwen-timeout-seconds", type=float, default=float(os.environ.get("QWEN_ASR_TIMEOUT_SECONDS", "180")))
     parser.add_argument("--qwen-max-new-tokens", type=int, default=int(os.environ.get("QWEN_ASR_MAX_NEW_TOKENS", "384")))
@@ -439,22 +440,40 @@ class EvidenceProcessor:
     def load_qwen(self) -> None:
         if self.qwen is not None:
             return
-        logging.info("正在 CPU 加载 Qwen3-ASR-1.7B（不会占用 GPU）")
-        os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
         import torch
         from qwen_asr import Qwen3ASRModel
-        torch.set_num_threads(max(1, min(self.args.qwen_cpu_threads, os.cpu_count() or 1)))
+        device = getattr(self.args, "qwen_device", "cpu")
+        if device == "cuda":
+            if not torch.cuda.is_available():
+                raise RuntimeError("QWEN_ASR_DEVICE=cuda，但 PyTorch 无法访问 CUDA GPU")
+            device_map = "cuda:0"
+            dtype = torch.bfloat16
+            logging.info("正在 GPU 加载 Qwen3-ASR-1.7B（%s，BF16）", torch.cuda.get_device_name(0))
+        else:
+            device_map = "cpu"
+            dtype = torch.float32
+            torch.set_num_threads(max(1, min(self.args.qwen_cpu_threads, os.cpu_count() or 1)))
+            logging.info("正在 CPU 加载 Qwen3-ASR-1.7B（不会占用 GPU）")
         self.qwen = Qwen3ASRModel.from_pretrained(
             self.args.qwen_model,
-            device_map="cpu",
-            dtype="float32",
-            max_inference_batch_size=1,
+            device_map=device_map,
+            dtype=dtype,
+            max_inference_batch_size=3 if device == "cuda" else 1,
             max_new_tokens=self.args.qwen_max_new_tokens,
         )
 
     def qwen_transcribe(self, audio: Path) -> str:
+        return self.qwen_transcribe_many([audio])[0]
+
+    def qwen_transcribe_many(self, audios: list[Path]) -> list[str]:
+        """Batch directional views on GPU; CPU remains single-item to bound RAM."""
+        if not audios:
+            return []
         self.load_qwen()
-        timeout = asr_timeout_budget(audio, self.args.qwen_timeout_seconds, self.args.asr_max_timeout_seconds)
+        timeout = max(
+            asr_timeout_budget(audio, self.args.qwen_timeout_seconds, self.args.asr_max_timeout_seconds)
+            for audio in audios
+        )
 
         def timed_out(signum, frame):
             raise TranscriptionTimeout(f"Qwen 主转写超过动态预算 {timeout:g} 秒", timeout_seconds=timeout)
@@ -462,8 +481,10 @@ class EvidenceProcessor:
         previous_handler = signal.signal(signal.SIGALRM, timed_out)
         signal.setitimer(signal.ITIMER_REAL, timeout)
         try:
-            result = self.qwen.transcribe(str(audio), language="Chinese")
-            return result[0].text.strip()
+            inputs: str | list[str]
+            inputs = str(audios[0]) if len(audios) == 1 else [str(audio) for audio in audios]
+            results = self.qwen.transcribe(inputs, language="Chinese")
+            return [result.text.strip() for result in results]
         finally:
             signal.setitimer(signal.ITIMER_REAL, 0)
             signal.signal(signal.SIGALRM, previous_handler)
@@ -741,22 +762,39 @@ class EvidenceProcessor:
             )
             channel = enhancement["reference_channel"]
             asr_views = []
-            for mic_channel, speech_microphone in enumerate(speech_microphones):
+            if getattr(self.args, "qwen_device", "cpu") == "cuda":
                 try:
-                    transcript = self.qwen_transcribe(speech_microphone)
-                    asr_views.append({
+                    directional_transcripts = self.qwen_transcribe_many(speech_microphones)
+                    asr_views.extend({
                         "channel": mic_channel,
                         "text": transcript,
                         "status": "ok" if transcript else "empty",
-                    })
+                    } for mic_channel, transcript in enumerate(directional_transcripts))
                 except TranscriptionTimeout as error:
-                    logging.error("麦克风 %d 转写超时，继续保留其他方向的观察：%s", mic_channel, error)
-                    asr_views.append({
+                    logging.error("三路方向麦克风批量转写超时：%s", error)
+                    asr_views.extend({
                         "channel": mic_channel,
                         "text": "",
                         "status": "timeout",
                         "timeout_seconds": error.timeout_seconds,
-                    })
+                    } for mic_channel in range(len(speech_microphones)))
+            else:
+                for mic_channel, speech_microphone in enumerate(speech_microphones):
+                    try:
+                        transcript = self.qwen_transcribe(speech_microphone)
+                        asr_views.append({
+                            "channel": mic_channel,
+                            "text": transcript,
+                            "status": "ok" if transcript else "empty",
+                        })
+                    except TranscriptionTimeout as error:
+                        logging.error("麦克风 %d 转写超时，继续保留其他方向的观察：%s", mic_channel, error)
+                        asr_views.append({
+                            "channel": mic_channel,
+                            "text": "",
+                            "status": "timeout",
+                            "timeout_seconds": error.timeout_seconds,
+                        })
             transcripts = [view["text"] for view in asr_views if view["text"]]
             if not transcripts and any(view["status"] == "timeout" for view in asr_views):
                 self.preserve_processing_failure(
@@ -764,7 +802,7 @@ class EvidenceProcessor:
                     reason="all_directional_asr_views_unavailable",
                     details={
                         "model": "Qwen3-ASR-1.7B",
-                        "device": "cpu",
+                        "device": getattr(self.args, "qwen_device", "cpu"),
                         "calls": len(asr_views),
                         "views": asr_views,
                         "speech_segments_ms": owned_segments,
@@ -938,7 +976,7 @@ class EvidenceProcessor:
                     "directional_asr": {
                         "model": "Qwen3-ASR-1.7B",
                         "runtime": "qwen-asr",
-                        "device": "cpu",
+                        "device": getattr(self.args, "qwen_device", "cpu"),
                         "calls": len(asr_views),
                         "language": "Chinese",
                         "input": "three_directional_microphone_views",
