@@ -60,6 +60,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--array-min-coherence", type=float, default=float(os.environ.get("ARRAY_MIN_COHERENCE", "0.15")))
     parser.add_argument("--array-reference-weight", type=float, default=float(os.environ.get("ARRAY_REFERENCE_WEIGHT", "0.70")))
     parser.add_argument("--qwen-model", default=os.environ.get("QWEN_ASR_MODEL", "Qwen/Qwen3-ASR-1.7B"))
+    parser.add_argument("--qwen-cpu-threads", type=int, default=int(os.environ.get("QWEN_ASR_CPU_THREADS", "16")))
     parser.add_argument("--qwen-timeout-seconds", type=float, default=float(os.environ.get("QWEN_ASR_TIMEOUT_SECONDS", "180")))
     parser.add_argument("--qwen-max-new-tokens", type=int, default=int(os.environ.get("QWEN_ASR_MAX_NEW_TOKENS", "384")))
     parser.add_argument("--asr-max-timeout-seconds", type=float, default=float(os.environ.get("ASR_MAX_TIMEOUT_SECONDS", "300")))
@@ -442,7 +443,7 @@ class EvidenceProcessor:
         os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
         import torch
         from qwen_asr import Qwen3ASRModel
-        torch.set_num_threads(max(1, min(16, os.cpu_count() or 1)))
+        torch.set_num_threads(max(1, min(self.args.qwen_cpu_threads, os.cpu_count() or 1)))
         self.qwen = Qwen3ASRModel.from_pretrained(
             self.args.qwen_model,
             device_map="cpu",
