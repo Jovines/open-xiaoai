@@ -34,6 +34,18 @@ OH2P 声卡拓扑、原厂进程边界、播放 fan-out 协议、内核兼容踩
 
 没有把录音文件本身改成“遇到静音才落盘”：无限延长或异常 VAD 都会让原始文件难恢复。当前采用开源流式 ASR 常见的双层结构——固定大小的可靠存储块，加上有状态的语音端点层。实现复用现有 FSMN-VAD；设计参考 [FunASR 的流式 FSMN-VAD 与 lookback 会话](https://github.com/modelscope/FunASR/blob/main/funasr/bin/realtime_ws.py) 和 [Silero VAD 的流式 `VADIterator`](https://github.com/snakers4/silero-vad)。Silero 适合作为未来异构复核，但当前不额外引入第二套运行时，避免两个 VAD 的边界规则互相冲突。
 
+## 历史重转写
+
+模型或提示词升级后，先把历史原始 FLAC 以硬链接放进独立 replay 根目录，用 `processor.py --once` 生成新版证据；不要覆盖生产 `evidence/`。确认全部 `.event.pending.json` 生成后，再用独立 audit ID 幂等发布：
+
+```bash
+python3 scripts/publish_historical_replay.py \
+  --evidence-dir /mnt/dx4600/家庭管家/录音/replay/<audit-id>/evidence \
+  --audit-id <audit-id>
+```
+
+脚本会派生稳定的 `audio-replay-*` 事件 ID，并写入 `provenance.historical_replay`；原事件、原音和旧转写均不覆盖。网络中断后可重复执行，Zeris 按事件 ID 去重。发布完成的清单改名为 `.event.replay.json`。随后由 Zeris 的历史重审入口把新版语音与同一 `occurred_at` 时间窗内的设备状态组合成只读 Episode，允许重新形成认知和低风险候选，但不会重放家电动作、规则或补采。
+
 ## 依赖与模型
 
 ```bash
