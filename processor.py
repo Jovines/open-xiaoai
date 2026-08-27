@@ -91,30 +91,16 @@ def normalize_asr_text(value: str) -> str:
     return re.sub(r"[\W_]+", "", value, flags=re.UNICODE).lower()
 
 
-def asr_reliability(primary: str, enhancement: dict) -> dict:
-    """Describe one-pass ASR usability without pretending to know word accuracy.
-
-    Array coherence is a signal-quality indicator.  It makes ordinary household
-    observations usable, while the permanent ``fallible_asr`` contract still
-    requires source verification before high-impact action.
-    """
-    score = float(enhancement.get("quality_score", 0.0) or 0.0)
-    fallback_fraction = float(enhancement.get("fallback_fraction", 1.0) or 0.0)
-    usable = bool(normalize_asr_text(primary)) and score >= 0.15 and fallback_fraction < 0.5
+def asr_reliability(transcripts: list[str]) -> dict:
+    """Expose fallible directional views without adjudicating their semantics."""
+    usable_views = sum(bool(normalize_asr_text(text)) for text in transcripts)
     return {
-        # The ingest contract calls this field agreement.  With single-pass ASR,
-        # medium means usable acoustic evidence, never multi-model consensus.
-        "agreement": "medium" if usable else "low",
-        "score": round(max(0.0, min(1.0, score)), 4),
-        "needs_review": not usable,
-        "basis": "single_pass_array_signal_quality",
-        "score_kind": "array_coherence_not_transcript_probability",
-        "notes": (
-            "三麦已先做时延对齐和加权融合，再由 Qwen 单次转写。当前声学质量可供低风险理解；"
-            "转写仍可能听错，时间、金额、医疗、门锁、承诺和自动执行必须结合原音、上下文或询问复核。"
-            if usable else
-            "三麦融合退化或通道相干性偏低；文本只能作为检索线索，需要回听原音或询问后再形成认知。"
-        ),
+        "agreement": "not_adjudicated",
+        "score": None,
+        "needs_review": False,
+        "basis": "three_directional_microphone_views",
+        "score_kind": "not_scored",
+        "notes": f"{usable_views} 路方向麦克风产生非空转写；采集层不投票、不要求一致，也不裁决语义，由 Zeris 结合全部候选和上下文理解。",
     }
 
 
@@ -753,40 +739,55 @@ class EvidenceProcessor:
                 reference_weight=self.args.array_reference_weight,
             )
             channel = enhancement["reference_channel"]
-            try:
-                # This is the only speech-recognition call in the production path.
-                primary = self.qwen_transcribe(enhanced_speech)
-            except TranscriptionTimeout as error:
+            asr_views = []
+            for mic_channel, speech_microphone in enumerate(speech_microphones):
+                try:
+                    transcript = self.qwen_transcribe(speech_microphone)
+                    asr_views.append({
+                        "channel": mic_channel,
+                        "text": transcript,
+                        "status": "ok" if transcript else "empty",
+                    })
+                except TranscriptionTimeout as error:
+                    logging.error("麦克风 %d 转写超时，继续保留其他方向的观察：%s", mic_channel, error)
+                    asr_views.append({
+                        "channel": mic_channel,
+                        "text": "",
+                        "status": "timeout",
+                        "timeout_seconds": error.timeout_seconds,
+                    })
+            transcripts = [view["text"] for view in asr_views if view["text"]]
+            if not transcripts and any(view["status"] == "timeout" for view in asr_views):
                 self.preserve_processing_failure(
                     source,
-                    reason="primary_asr_timeout",
+                    reason="all_directional_asr_views_unavailable",
                     details={
                         "model": "Qwen3-ASR-1.7B",
                         "device": "cpu",
-                        "timeout_seconds": error.timeout_seconds,
-                        "input": "three_microphone_array_enhanced_mono",
+                        "calls": len(asr_views),
+                        "views": asr_views,
                         "speech_segments_ms": owned_segments,
-                        "array_enhancement": enhancement,
-                        "error": str(error),
                     },
                 )
                 self.consume_carry(source)
                 return "processing_failed"
-            if not primary:
+            if not transcripts:
                 self.quarantine_audio(
                     source,
                     classification="no_reliable_speech",
                     classifier={
-                        "primary_model": "Qwen3-ASR-1.7B",
-                        "primary_transcript_empty": True,
+                        "model": "Qwen3-ASR-1.7B",
+                        "directional_views": asr_views,
                         "vad": "FSMN-VAD",
                         "channels_checked": 3,
-                        "array_enhancement": enhancement,
                     },
                 )
                 self.consume_carry(source)
                 return "discarded"
-            selected_transcript = primary
+            transcript_observation = "\n".join(
+                f"[microphone-{view['channel']}] {view['text']}"
+                for view in asr_views if view["text"]
+            )
 
             speakers, speaker_embeddings, diarization_status = self.diarize(
                 microphones[channel],
@@ -814,9 +815,9 @@ class EvidenceProcessor:
             if evidence_audio.exists():
                 raise RuntimeError(f"证据文件已存在，拒绝覆盖：{evidence_audio}")
             source.replace(evidence_audio)
-            enhanced_audio = evidence_audio.with_suffix(".asr.flac")
+            enhanced_audio = evidence_audio.with_suffix(".array.flac")
             if enhanced_audio.exists():
-                raise RuntimeError(f"ASR 派生音频已存在，拒绝覆盖：{enhanced_audio}")
+                raise RuntimeError(f"阵列分析派生音频已存在，拒绝覆盖：{enhanced_audio}")
             archive_asr_derivative(enhanced_speech, enhanced_audio)
             enhanced_relative = enhanced_audio.relative_to(self.args.evidence_dir)
             enhanced_ref = {
@@ -825,6 +826,21 @@ class EvidenceProcessor:
                 "sample_rate": enhancement["sample_rate"],
                 "channels": 1,
             }
+            asr_input_refs = []
+            for view, speech_microphone in zip(asr_views, speech_microphones):
+                derivative = evidence_audio.with_suffix(f".mic{view['channel']}.asr.flac")
+                if derivative.exists():
+                    raise RuntimeError(f"方向麦克风 ASR 派生音频已存在，拒绝覆盖：{derivative}")
+                archive_asr_derivative(speech_microphone, derivative)
+                relative_derivative = derivative.relative_to(self.args.evidence_dir)
+                input_ref = {
+                    "uri": f"{self.args.nas_uri_root.rstrip('/')}/{relative_derivative.as_posix()}",
+                    "sha256": sha256_file(derivative),
+                    "sample_rate": 16000,
+                    "channels": 1,
+                }
+                view["input_audio"] = input_ref
+                asr_input_refs.append(input_ref)
 
             referenced_sources = sources if event_end_ms > boundary_ms and lookahead is not None else [source]
             referenced_durations = durations_ms[:len(referenced_sources)]
@@ -864,7 +880,10 @@ class EvidenceProcessor:
             except (OSError, ValueError, RuntimeError) as error:
                 logging.warning("三麦空间特征计算失败但不阻断证据：%s", error)
                 spatial_features = {"status": "failed"}
-            scene = infer_scene(acoustic_scene, audio_tagging, selected_transcript, spatial_features)
+            # Repeating three directional views would look like a language drill
+            # to the legacy rule classifier.  Semantic scene interpretation now
+            # belongs to Zeris, so this acoustic helper does not pick one view.
+            scene = infer_scene(acoustic_scene, audio_tagging, "", spatial_features)
             profile_assignments = {}
             if getattr(self.args, "speaker_profiles_enabled", False):
                 try:
@@ -888,7 +907,7 @@ class EvidenceProcessor:
                 for speaker in filtered_speakers
             ]
 
-            reliability = asr_reliability(primary, enhancement)
+            reliability = asr_reliability([view["text"] for view in asr_views])
             event = {
                 "event_id": f"audio-{identity[:24]}",
                 "occurred_at": occurred.isoformat(),
@@ -898,9 +917,16 @@ class EvidenceProcessor:
                 "audio_sha256": digest,
                 "audio_refs": refs,
                 "playback_refs": playback_refs,
-                "transcript": selected_transcript,
+                "transcript": transcript_observation,
                 "language": "zh",
-                "alternatives": [],
+                "alternatives": [{
+                    "model": "Qwen3-ASR-1.7B",
+                    "version": f"microphone-{view['channel']}",
+                    "channel": view["channel"],
+                    "text": view["text"],
+                    "status": view["status"],
+                    "input_audio": view["input_audio"],
+                } for view in asr_views if view["text"]],
                 "speakers": filtered_speakers,
                 "acoustic_scene": acoustic_scene,
                 "scene": scene,
@@ -908,14 +934,15 @@ class EvidenceProcessor:
                 "provenance": {
                     "schema_version": 1,
                     "evidence_kind": "fallible_asr",
-                    "primary_asr": {
+                    "directional_asr": {
                         "model": "Qwen3-ASR-1.7B",
                         "runtime": "qwen-asr",
                         "device": "cpu",
-                        "calls": 1,
+                        "calls": len(asr_views),
                         "language": "Chinese",
-                        "input": "gcc_phat_weighted_delay_and_sum_mono",
-                        "input_audio": enhanced_ref,
+                        "input": "three_directional_microphone_views",
+                        "semantic_selection": "none_capture_layer_defers_to_zeris",
+                        "views": asr_views,
                         "speech_segments_ms": owned_segments,
                     },
                     "array_vad": {
@@ -929,7 +956,8 @@ class EvidenceProcessor:
                     "audio": {
                         "storage_blocks": properties,
                         "raw_source": "48kHz_24bit_3channel_lossless_flac",
-                        "asr_derivative": enhanced_ref,
+                        "asr_derivatives": asr_input_refs,
+                        "array_analysis_derivative": enhanced_ref,
                         "fixed_block_seconds": properties[0]["duration_seconds"],
                         "lookahead_used": lookahead is not None,
                         "boundary_ownership": "utterance_start",
@@ -977,8 +1005,8 @@ class EvidenceProcessor:
                 pending.replace(evidence_audio.with_suffix(evidence_audio.suffix + ".event.json"))
                 self.finish_pending(pending)
             logging.info(
-                "已保留跨边界语音证据：%s（%d 个 VAD 区间，三麦融合质量 %.3f，ASR 调用 1 次）",
-                evidence_audio, len(owned_segments), reliability["score"],
+                "已保留跨边界语音证据：%s（%d 个 VAD 区间，%d 路方向转写，采集层未裁决）",
+                evidence_audio, len(owned_segments), len(transcripts),
             )
             return "evidence"
 

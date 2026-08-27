@@ -51,16 +51,17 @@ class ProcessorTests(unittest.TestCase):
             asr_max_timeout_seconds=300,
         ))
 
-    def test_good_array_signal_is_usable_without_claiming_high_asr_agreement(self):
-        result = asr_reliability("明天交水费", {"quality_score": 0.72, "fallback_fraction": 0.0})
-        self.assertEqual(result["agreement"], "medium")
+    def test_directional_transcripts_are_not_adjudicated_by_capture_layer(self):
+        result = asr_reliability(["明天交水费", "明天交水电费", "明天交水费"])
+        self.assertEqual(result["agreement"], "not_adjudicated")
         self.assertFalse(result["needs_review"])
-        self.assertIn("低风险理解", result["notes"])
+        self.assertIsNone(result["score"])
+        self.assertIn("不投票、不要求一致", result["notes"])
 
-    def test_array_fallback_stays_reviewable(self):
-        result = asr_reliability("明天交水费", {"quality_score": 0.7, "fallback_fraction": 1.0})
-        self.assertEqual(result["agreement"], "low")
-        self.assertTrue(result["needs_review"])
+    def test_empty_direction_is_preserved_without_rejecting_other_views(self):
+        result = asr_reliability(["", "明天交水费", ""])
+        self.assertEqual(result["agreement"], "not_adjudicated")
+        self.assertIn("1 路方向麦克风", result["notes"])
 
     def test_asr_timeout_scales_for_a_full_minute_of_speech(self):
         with mock.patch("processor.audio_properties", return_value={"duration_seconds": 60}):
